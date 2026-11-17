@@ -45,7 +45,12 @@ export function uploadPack(repo: Repo, body: Buffer, v2: boolean): Buffer {
   const cached = repo.fetchCache.get(cacheKey);
   if (cached) return cached;
   const { lines } = parsePackets(body);
-  if (lines.includes('command=ls-refs')) return lsRefs(repo, lines);
+  if (lines.includes('command=ls-refs')) {
+    const response = lsRefs(repo, lines);
+    if (repo.fetchCache.size >= 16) repo.fetchCache.delete(repo.fetchCache.keys().next().value!);
+    repo.fetchCache.set(cacheKey, response);
+    return response;
+  }
   const wants = [...new Set(lines.filter(l => l.startsWith('want ')).map(l => l.split(' ')[1]))];
   const haves = lines.filter(l => l.startsWith('have ')).map(l => l.slice(5));
   const shallow = lines.filter(l => l.startsWith('shallow ')).map(l => l.slice(8));

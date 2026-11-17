@@ -6,7 +6,7 @@ export type Comment = { id: number; node_id: string; body: string; created_at: s
 export type Issue = {
   id: number; node_id: string; number: number; title: string; body: string; state: string;
   labels: Label[]; created_at: string; updated_at: string; closed_at: string | null;
-  comments: Comment[]; serialized?: string;
+  comments: Comment[]; serialized?: Buffer;
 };
 export type Pull = {
   id: number; node_id: string; number: number; title: string; body: string; state: string;
@@ -26,6 +26,7 @@ export class Store {
   repos = new Map<string, Repo>();
   nodes = new Map<string, NodeRecord>();
   login = process.env.FORGE_OWNER_LOGIN ?? '';
+  private cachedUser: any;
   nextId = 1;
   epoch: number;
   now: string;
@@ -37,7 +38,9 @@ export class Store {
   }
 
   user(): any {
-    return { login: this.login || 'mubudot', id: 1, node_id: globalId('User', 1), name: 'Ethan Moore', type: 'User' };
+    const login = this.login || 'mubudot';
+    if (this.cachedUser?.login !== login) this.cachedUser = { login, id: 1, node_id: globalId('User', 1), name: 'Ethan Moore', type: 'User' };
+    return this.cachedUser;
   }
 
   identity(kind: string, value: any, repo?: Repo): void {

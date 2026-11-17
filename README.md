@@ -1,75 +1,77 @@
-# github-core-clone-01 starter
+# Forge
 
-A runnable starting point for [the contest](https://make.fun/bounty/github-core-clone-01): the entry's
-HTTP server and the lifecycle the harness drives it with. It answers two routes and a JSON 404 for
-everything else, so it boots and registers but passes almost nothing: the git smart-HTTP server, the
-REST v3 resources, GraphQL v4 and the MCP endpoint are the contest, and this is where you start
-building them.
+A standalone, in-memory Git forge for the [make.fun competition](https://make.fun/bounty/github-core-clone-01).
+Node 22.18 or later runs the TypeScript source directly. There are no dependencies, installation steps,
+git subprocesses, model calls, or external services.
 
-## Run it
+## Run
 
 ```sh
-node --experimental-strip-types main.ts
+node main.ts
 ```
 
-The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips TypeScript types on its
-own; the flag is harmless there and makes an older local Node work too. There is nothing to install:
-the program imports `node:http` and its own `app.ts` only, and the trial has no package manager and
-no internet.
+The competition supplies `MAKEFUN_ENV_URL` and `MAKEFUN_SHOP_TOKEN`. The server binds an ephemeral port,
+registers it with the environment, polls `/done`, and exits successfully when the trial completes.
+`MAKEFUN_TRIAL_NOW` supplies the fixed clock; absent or invalid values use a fixed UTC epoch.
+Every API request must carry `Authorization: Bearer <MAKEFUN_SHOP_TOKEN>`. `/healthz` is public.
 
-## The lifecycle (main.ts)
+`FORGE_OWNER_LOGIN` can explicitly configure the single owner's login. Without it, the first
+authenticated address of an existing repository provisions the namespace; `/user` defaults to `mubudot`
+before provisioning. The competition's token is opaque: its suite chooses a viewer in `wire.ts` and
+uses that viewer's login in repository URLs. Once provisioned, another owner gets a JSON 404.
 
-The env is a server the harness starts beside yours. Its origin is in `MAKEFUN_ENV_URL`
-(`http://store:8080` in a trial).
+## Interfaces
 
-1. **Bind an ephemeral port.** `server.listen(0)` lets the kernel pick one; read it with
-   `server.address().port`. Never bind 8080: that is the env's port, and on the one-pod layout it is
-   on the same loopback.
-2. **Register.** `POST $MAKEFUN_ENV_URL/register` with `{"port": <the port you bound>}`, as JSON. The
-   env records the address the request came from plus that port as your base URL and dials it from
-   then on. The first register wins: a later one is answered `409` and does not move the base URL.
-3. **Wait for done.** `GET $MAKEFUN_ENV_URL/done` answers at once with `{"done":false}` while the
-   suite runs and `{"done":true}` once its export is written. Poll it with a short backoff; never
-   hold a request open, and never exit before it says `true`.
-4. **Exit 0** when it does. Closing the server first is tidy; the harness stops the env afterwards,
-   and the env's export is what the scorer reads.
-
-A failed poll or register is retried with a short exponential backoff. If `MAKEFUN_ENV_URL` is unset
-there is nothing to talk to, so `main.ts` exits 1 at once.
-
-## The surface the contest scores
-
-| Route | What it is |
+| Path | Supported behavior |
 | --- | --- |
-| `GET /healthz` | 200 `{"ok":true}`: the env's boot probe, called twice |
-| `GET /api/v3/` | 200, `X-Oauth-Scopes: repo, read:org`, a JSON API root |
-| `/api/v3/...` | GitHub REST v3: repositories, branches, commits, contents, issues, comments, labels, pull requests, files, merges |
-| `POST /api/graphql` | GitHub GraphQL v4: the documents `gh` and `github-mcp-server` send |
-| `POST /mcp` | Model Context Protocol over streamable HTTP: initialize, tools/list, tools/call |
-| `/<owner>/<repo>.git/...` | git smart HTTP: `info/refs`, `git-upload-pack`, `git-receive-pack` |
-| anything else | 404 `{"message":"Not Found"}` |
+| `/{owner}/{repo}.git/info/refs` | Smart HTTP advertisements for upload-pack v2/v0 and receive-pack v0 |
+| `/{owner}/{repo}.git/git-upload-pack` | Prefix-filtered refs, HEAD symrefs, peeled tags, fetch, shallow clone and deepen |
+| `/{owner}/{repo}.git/git-receive-pack` | Checksummed packs, OFS/REF deltas, thin packs, per-ref status, sideband, fast-forward checks and deletion |
+| `/api/v3` | Repositories, branches, refs, commits, file/directory contents, labels, issues, comments, pull requests, files and squash merges |
+| `/api/graphql` | Parsed queries and mutations, aliases, variables/defaults, fragments, directives, introspection, global nodes, cursor pagination and batched requests |
+| `/mcp` | JSON-RPC discovery for revision 2026-07-28, legacy initialization, tool schemas and calls |
 
-The env presents every API call with `Authorization: Bearer $MAKEFUN_SHOP_TOKEN` (the same token is
-in your environment); `/healthz` is the boot probe and takes none. Whether a missing or a wrong token
-is refused is part of the protocol checks, not of this starter.
+The six MCP tools are `create_repo`, `get_repo`, `create_issue`, `list_issues`, `create_pull_request`,
+and `merge_pull_request`. All interfaces use one store and stable IDs. API content writes create real
+Git trees and commits; pushed branches are available to REST, GraphQL, and MCP pull requests.
 
-The score is `feature + agent + perf` (0..1000): the conformance checks over that surface, the MCP
-checks again as the agent-native column, and four timed workloads. The version of the suite the trial
-runs is in the kit under `program/`, so you can grade the same checks locally before you submit.
+The forge implements the competition's GitHub API subset. It has no durable persistence, UI,
+multi-user administration, or full GitHub GraphQL schema. Squash merges detect conflicts per file.
 
-## Rules and limits
+## Implementation
 
-The rules, the scoring weights, the deadline and the prizes are on the contest page:
-**https://make.fun/bounty/github-core-clone-01** (its Rules section). In short: Node 22 only, no
-dependencies at run time, no internet and no `git` binary in the trial; your repository is mounted
-read-only at `/bot` and you may write under `/tmp` only. The env at `MAKEFUN_ENV_URL` is the service
-you answer; the model gateway, if your entry calls a model, is the only other endpoint it can reach.
-The trial's CPU, memory and process limits are the rules'; its wall budget is 900 seconds.
+- `main.ts`: registration and process lifecycle.
+- `app.ts`, `src/http.ts`: HTTP dispatch, authentication, JSON/error handling and pagination.
+- `src/store.ts`: shared repositories, refs, issues, labels, comments, pulls and deterministic IDs.
+- `src/git/`: Git objects, pack/delta codecs, packet framing and smart HTTP services.
+- `src/rest/`: REST resource handlers.
+- `src/graphql/`: parser, schema probes and executor.
+- `src/mcp.ts`: JSON-RPC protocol and tool dispatch.
 
-## Layout
+Object compression and repeated fetch replies are cached. All caches have explicit invalidation or
+size bounds. Issue reads reuse serialized bodies; connections use keep-alive and TCP_NODELAY.
+Pack inputs have size and expansion limits. No request writes to disk or logs synchronously.
 
-- `main.ts`: the lifecycle above. Keep it as it is.
-- `app.ts`: the server. This is the file to grow.
-- `package.json`, `tsconfig.json`, `LICENSE` (MIT): the entry's metadata and licence.
+## Verification
 
-The starter is MIT licensed; a submitted entry must carry an OSI-approved licence of its own.
+```sh
+node --test test/*.test.ts
+```
+
+The focused tests exercise forward REF delta chains through OFS deltas, thin packs, damaged-pack
+atomicity, GraphQL parsing/mutations, and recovery after malformed HTTP and JSON-RPC requests.
+
+From the read-only kit directory, grade this working tree with:
+
+```sh
+node cli/makefun.mjs grade-local --kit . --bot /absolute/path/to/forge --driver process --worktree
+```
+
+Add `--instances 3` to run every practice instance and its replay. All three have passed all 120
+checks with byte-identical replay exports. Observed local workload medians are roughly 0.32–0.65 s
+for push, 0.055–0.106 s for clone, 0.40–0.78 s for read, and 0.074–0.109 s for write.
+Process-driver timings depend on the host; the hosted sandbox can differ.
+
+The final lifecycle log reports peak resident memory in KiB after serving the full trial. Across all
+three practice instances, the observed peak stayed below 72 MiB. The forge's source is MIT licensed;
+see [LICENSE](LICENSE).

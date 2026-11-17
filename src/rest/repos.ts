@@ -18,7 +18,10 @@ export function repoRoutes(store: Store, repo: Repo, method: string, tail: strin
     if (method === 'GET') json(res, 200, store.repoView(repo));
     else if (method === 'PATCH') {
       if (body.description !== undefined) repo.description = body.description;
-      if (body.default_branch !== undefined) repo.default_branch = requiredString(body.default_branch, 'default_branch');
+      if (body.default_branch !== undefined) {
+        repo.default_branch = requiredString(body.default_branch, 'default_branch');
+        repo.fetchCache.clear();
+      }
       if (body.private !== undefined) repo.private = body.private === true;
       json(res, 200, store.repoView(repo));
     } else if (method === 'DELETE') { store.deleteRepo(repo); json(res, 204, null); }

@@ -93,6 +93,7 @@ async function main(): Promise<void> {
   await waitForDone();
   server.close();
   server.closeIdleConnections();
+  process.stderr.write(`[entry] peak RSS ${process.resourceUsage().maxRSS} KiB\n`);
   process.stdout.write('[entry] done\n');
 }
 

@@ -9,13 +9,23 @@ import { pullRoutes } from './src/rest/pulls.ts';
 import { execute } from './src/graphql/executor.ts';
 import { mcp, rpcError } from './src/mcp.ts';
 
-async function dispatch(store: Store, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+type Route = { url: URL; parts: string[]; git: RegExpExecArray | null };
+
+async function dispatch(store: Store, routes: Map<string, Route>, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const key = `${req.headers.host}:${req.url}`;
+  let route = routes.get(key);
+  if (!route) {
+    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+    route = { url, parts: url.pathname.split('/').filter(Boolean).map(decodeURIComponent),
+      git: /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(url.pathname) };
+    if (routes.size >= 512) routes.delete(routes.keys().next().value!);
+    routes.set(key, route);
+  }
+  const { url, parts, git } = route;
   const path = url.pathname;
   const method = req.method ?? 'GET';
   if (path === '/healthz' && method === 'GET') { json(res, 200, { ok: true }); return; }
   if (!authorized(req)) throw new HttpError(401, 'Bad credentials');
-  const git = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
   if (git) {
     const repo = store.requireRepo(decodeURIComponent(git[1]), decodeURIComponent(git[2]));
     const v2 = req.headers['git-protocol'] === 'version=2';
@@ -52,7 +62,6 @@ async function dispatch(store: Store, req: IncomingMessage, res: ServerResponse)
     if (method !== 'GET') throw new HttpError(404, 'Not Found');
     json(res, 200, { current_user_url: '/api/v3/user', repository_url: '/api/v3/repos/{owner}/{repo}' }, { 'x-oauth-scopes': 'repo, read:org' }); return;
   }
-  const parts = path.split('/').filter(Boolean).map(decodeURIComponent);
   if (parts[0] === 'api' && parts[1] === 'v3') {
     body = objectBody(body);
     if (parts.length === 3 && parts[2] === 'meta' && method === 'GET') { json(res, 200, { installed_version: 'forge-1.0.0' }); return; }
@@ -72,8 +81,10 @@ async function dispatch(store: Store, req: IncomingMessage, res: ServerResponse)
 
 export function createApp(): Server {
   const store = new Store();
+  const routes = new Map<string, Route>();
   const server = createServer({ noDelay: true, keepAlive: true }, (req, res) => {
-    void dispatch(store, req, res).catch((error: unknown) => {
+    res.sendDate = false;
+    void dispatch(store, routes, req, res).catch((error: unknown) => {
       if (error instanceof HttpError) json(res, error.status, { message: error.message });
       else json(res, 400, { message: 'Invalid request' });
     });

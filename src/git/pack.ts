@@ -67,7 +67,7 @@ export function readPack(pack: Buffer, db: ObjectDatabase): void {
   type Entry = { offset: number; code: number; data: Buffer; baseOffset?: number; baseOid?: string; object?: GitObject; oid?: string; packed?: Buffer };
   const entries: Entry[] = [], byOffset = new Map<number, Entry>();
   const resolved = new Map<string, GitObject>();
-  let pos = 12;
+  let pos = 12, expandedBytes = 0;
   for (let i = 0; i < count; i++) {
     const offset = pos;
     let byte = pack[pos++], size = byte & 15, shift = 4;
@@ -79,6 +79,8 @@ export function readPack(pack: Buffer, db: ObjectDatabase): void {
       shift += 7;
     }
     if (size > MAX_OBJECT) throw new Error('Pack object too large');
+    expandedBytes += size;
+    if (expandedBytes > 64 * 1024 * 1024) throw new Error('Pack expands beyond the memory limit');
     let baseOffset: number | undefined, baseOid: string | undefined;
     if (code === 6) {
       byte = pack[pos++];
@@ -95,7 +97,7 @@ export function readPack(pack: Buffer, db: ObjectDatabase): void {
       baseOid = pack.toString('hex', pos, pos + 20);
       pos += 20;
     } else if (!types[code]) throw new Error('Invalid pack object type');
-    const result = inflateSync(pack.subarray(pos, end), { info: true, maxOutputLength: MAX_OBJECT }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    const result = inflateSync(pack.subarray(pos, end), { info: true, maxOutputLength: Math.max(1, size), chunkSize: Math.max(64, Math.min(size, 65536)) }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
     pos += result.engine.bytesWritten;
     if (result.buffer.length !== size) throw new Error('Pack object size mismatch');
     const entry: Entry = { offset, code, data: result.buffer, baseOffset, baseOid };
@@ -115,6 +117,8 @@ export function readPack(pack: Buffer, db: ObjectDatabase): void {
       const base = entry.code === 6 ? byOffset.get(entry.baseOffset!)?.object : resolved.get(entry.baseOid!) ?? db.objects.get(entry.baseOid!);
       if (!base) { next.push(entry); continue; }
       entry.object = { type: base.type, data: applyDelta(base.data, entry.data) };
+      expandedBytes += entry.object.data.length;
+      if (expandedBytes > 64 * 1024 * 1024) throw new Error('Pack expands beyond the memory limit');
       entry.oid = hashObject(base.type, entry.object.data);
       resolved.set(entry.oid, entry.object);
     }
