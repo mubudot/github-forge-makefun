@@ -1,77 +1,61 @@
-# Forge
+# github-forge-makefun
 
-A standalone, in-memory Git forge for the [make.fun competition](https://make.fun/bounty/github-core-clone-01).
-Node 22.18 or later runs the TypeScript source directly. There are no dependencies, installation steps,
-git subprocesses, model calls, or external services.
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/mubudot/github-forge-makefun/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/mubudot/github-forge-makefun/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
-## Run
+A standalone GitHub-compatible forge for the competition's API subset, written in erasable
+TypeScript for Node 22.18 or later. It uses only the standard library, keeps state in memory,
+and runs without installation, a git subprocess, or external services.
+
+Built by **Ethan Moore (mubudot)**.
+
+- `main.ts` handles registration and completion polling. `app.ts`, `src/http.ts`, and `src/fast.ts`
+  provide authenticated HTTP routing, JSON errors, request IDs, and synchronous hot routes.
+- `src/store.ts` shares repositories, deterministic IDs, issues, labels, comments, and pulls across
+  REST v3, GraphQL v4, and MCP. `src/rest/` implements branches, commits, contents, issue workflows,
+  pull files, and squash merges with conflict detection per file.
+- `src/git/` implements SHA-1 objects, checksummed packs, OFS/REF deltas, pkt-lines, upload-pack
+  v2/v0 with shallow fetch/deepen, and receive-pack v0 with fast-forward checks and per-ref reports.
+- `src/graphql/` parses selections, variables, aliases, fragments, and directives, executes shared
+  store mutations, and supports introspection and cursor pagination. `src/mcp.ts` provides JSON-RPC
+  discovery for revision 2026-07-28, legacy initialization, and six repository/issue/pull tools.
+
+The performance design caches parsed routes, serialized issue reads, compressed Git objects,
+fetch replies, and report-status packets. Hot routes cache the expected bearer header and avoid
+per-request URL parsing. Responses use one `res.end()` with known content lengths; Node's corking
+coalesces header/body writes. Keep-alive and TCP_NODELAY are enabled. Optional Git negotiation is
+kept small. Mutations invalidate caches, and timestamps derive from `MAKEFUN_TRIAL_NOW`.
+
+All 120 conformance checks, including 15 MCP checks, pass with matching replay exports. A measured
+three-run tuning batch, with forge and suite sharing CPUs 0 and 1, produced median ranges of
+297–316 ms push, 55–69 ms clone, 451–504 ms read, and 67–86 ms write. The stricter quiet-machine
+4× targets of 130/30/225/30 ms remain unmet; published production-reference scores do not establish
+production speed. These are local process-driver measurements, and timings vary by host.
+
+The forge implements a bounded API subset with no persistence, UI, multi-user administration, or
+full GitHub GraphQL schema. `FORGE_OWNER_LOGIN` can configure its single owner; otherwise the first
+authenticated address of an existing repository provisions the namespace.
+
+## Run it
 
 ```sh
+# The competition environment must already be running at this origin.
+MAKEFUN_ENV_URL=http://127.0.0.1:8080 \
+MAKEFUN_SHOP_TOKEN=local-development-token \
+MAKEFUN_TRIAL_NOW=2026-01-01T00:00:00Z \
 node main.ts
-```
 
-The competition supplies `MAKEFUN_ENV_URL` and `MAKEFUN_SHOP_TOKEN`. The server binds an ephemeral port,
-registers it with the environment, polls `/done`, and exits successfully when the trial completes.
-`MAKEFUN_TRIAL_NOW` supplies the fixed clock; absent or invalid values use a fixed UTC epoch.
-Every API request must carry `Authorization: Bearer <MAKEFUN_SHOP_TOKEN>`. `/healthz` is public.
+# From the forge checkout, grade the current files against the supplied kit.
+FORGE_DIR="$PWD"
+KIT_DIR=/workspace/projects/2de6bbf5-9a6e-4c92-adbd-7caaf9109ad3/makefun/github-core-clone-01-kit
+(cd "$KIT_DIR" && taskset -c 0,1 node cli/makefun.mjs grade-local \
+  --kit . --bot "$FORGE_DIR" --driver process --worktree)
 
-`FORGE_OWNER_LOGIN` can explicitly configure the single owner's login. Without it, the first
-authenticated address of an existing repository provisions the namespace; `/user` defaults to `mubudot`
-before provisioning. The competition's token is opaque: its suite chooses a viewer in `wire.ts` and
-uses that viewer's login in repository URLs. Once provisioned, another owner gets a JSON 404.
-
-## Interfaces
-
-| Path | Supported behavior |
-| --- | --- |
-| `/{owner}/{repo}.git/info/refs` | Smart HTTP advertisements for upload-pack v2/v0 and receive-pack v0 |
-| `/{owner}/{repo}.git/git-upload-pack` | Prefix-filtered refs, HEAD symrefs, peeled tags, fetch, shallow clone and deepen |
-| `/{owner}/{repo}.git/git-receive-pack` | Checksummed packs, OFS/REF deltas, thin packs, per-ref status, sideband, fast-forward checks and deletion |
-| `/api/v3` | Repositories, branches, refs, commits, file/directory contents, labels, issues, comments, pull requests, files and squash merges |
-| `/api/graphql` | Parsed queries and mutations, aliases, variables/defaults, fragments, directives, introspection, global nodes, cursor pagination and batched requests |
-| `/mcp` | JSON-RPC discovery for revision 2026-07-28, legacy initialization, tool schemas and calls |
-
-The six MCP tools are `create_repo`, `get_repo`, `create_issue`, `list_issues`, `create_pull_request`,
-and `merge_pull_request`. All interfaces use one store and stable IDs. API content writes create real
-Git trees and commits; pushed branches are available to REST, GraphQL, and MCP pull requests.
-
-The forge implements the competition's GitHub API subset. It has no durable persistence, UI,
-multi-user administration, or full GitHub GraphQL schema. Squash merges detect conflicts per file.
-
-## Implementation
-
-- `main.ts`: registration and process lifecycle.
-- `app.ts`, `src/http.ts`: HTTP dispatch, authentication, JSON/error handling and pagination.
-- `src/store.ts`: shared repositories, refs, issues, labels, comments, pulls and deterministic IDs.
-- `src/git/`: Git objects, pack/delta codecs, packet framing and smart HTTP services.
-- `src/rest/`: REST resource handlers.
-- `src/graphql/`: parser, schema probes and executor.
-- `src/mcp.ts`: JSON-RPC protocol and tool dispatch.
-
-Object compression and repeated fetch replies are cached. All caches have explicit invalidation or
-size bounds. Issue reads reuse serialized bodies; connections use keep-alive and TCP_NODELAY.
-Pack inputs have size and expansion limits. No request writes to disk or logs synchronously.
-
-## Verification
-
-```sh
+# Focused protocol, parser, cache-invalidation, and lifecycle regression tests.
 node --test test/*.test.ts
 ```
 
-The focused tests exercise forward REF delta chains through OFS deltas, thin packs, damaged-pack
-atomicity, GraphQL parsing/mutations, and recovery after malformed HTTP and JSON-RPC requests.
+---
 
-From the read-only kit directory, grade this working tree with:
-
-```sh
-node cli/makefun.mjs grade-local --kit . --bot /absolute/path/to/forge --driver process --worktree
-```
-
-Add `--instances 3` to run every practice instance and its replay. All three have passed all 120
-checks with byte-identical replay exports. Observed local workload medians are roughly 0.32–0.65 s
-for push, 0.055–0.106 s for clone, 0.40–0.78 s for read, and 0.074–0.109 s for write.
-Process-driver timings depend on the host; the hosted sandbox can differ.
-
-The final lifecycle log reports peak resident memory in KiB after serving the full trial. Across all
-three practice instances, the observed peak stayed below 72 MiB. The forge's source is MIT licensed;
-see [LICENSE](LICENSE).
+<sub>Entered on [make.fun](https://make.fun/?ref=pytfvkay&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
