@@ -6,6 +6,8 @@ import { receivePack } from './src/git/receive-pack.ts';
 import { repoRoutes } from './src/rest/repos.ts';
 import { issueRoutes } from './src/rest/issues.ts';
 import { pullRoutes } from './src/rest/pulls.ts';
+import { execute } from './src/graphql/executor.ts';
+import { mcp, rpcError } from './src/mcp.ts';
 
 async function dispatch(store: Store, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -33,7 +35,18 @@ async function dispatch(store: Store, req: IncomingMessage, res: ServerResponse)
   let body: any = {};
   if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
     const bytes = await readBody(req);
-    if (bytes.length) body = parseJson(bytes);
+    try { if (bytes.length) body = parseJson(bytes); }
+    catch (error) {
+      if (path === '/mcp') { json(res, 400, rpcError(null, -32700, 'Parse error')); return; }
+      throw error;
+    }
+  }
+  if (path === '/mcp' && method === 'POST') {
+    const reply = mcp(store, body, req.headers);
+    json(res, reply.status, reply.body); return;
+  }
+  if (path === '/api/graphql' && method === 'POST') {
+    json(res, 200, Array.isArray(body) ? body.map(operation => execute(store, operation)) : execute(store, body)); return;
   }
   if (path === '/api/v3' || path === '/api/v3/') {
     if (method !== 'GET') throw new HttpError(404, 'Not Found');

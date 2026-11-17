@@ -92,6 +92,7 @@ async function main(): Promise<void> {
 
   await waitForDone();
   server.close();
+  server.closeIdleConnections();
   process.stdout.write('[entry] done\n');
 }
 
