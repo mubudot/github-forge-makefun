@@ -9,19 +9,22 @@ export class HttpError extends Error {
 }
 
 let requestId = 0;
-export function json(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+export const JSON_TYPE = 'application/json; charset=utf-8';
+const responseHeaders = ['content-type', '', 'content-length', '', 'x-github-request-id', ''];
+export function json(res: ServerResponse, status: number, body: unknown, headers?: Record<string, string>): void {
   const data = JSON.stringify(body);
-  send(res, status, data, 'application/json; charset=utf-8', headers);
+  send(res, status, data, JSON_TYPE, headers);
 }
 
-export function send(res: ServerResponse, status: number, data: string | Buffer, type: string, headers: Record<string, string> = {}): void {
+export function send(res: ServerResponse, status: number, data: string | Buffer, type: string, headers?: Record<string, string>, length?: number): void {
   if (res.destroyed || res.writableEnded) return;
-  res.writeHead(status, {
-    'content-type': type,
-    'content-length': Buffer.byteLength(data),
-    'x-github-request-id': (++requestId).toString(16),
-    ...headers,
+  responseHeaders[1] = type;
+  responseHeaders[3] = String(length ?? Buffer.byteLength(data));
+  responseHeaders[5] = (++requestId).toString(16);
+  if (headers) res.writeHead(status, {
+    'content-type': type, 'content-length': responseHeaders[3], 'x-github-request-id': responseHeaders[5], ...headers,
   });
+  else res.writeHead(status, responseHeaders);
   res.end(data);
 }
 
@@ -31,18 +34,31 @@ export function authorized(req: IncomingMessage): boolean {
 }
 
 export function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const parts: Buffer[] = [];
-    let size = 0;
-    req.on('data', (part: Buffer) => {
-      size += part.length;
-      if (size > 32 * 1024 * 1024) reject(new HttpError(413, 'Request body too large'));
-      else parts.push(part);
-    });
-    req.on('end', () => resolve(parts.length === 1 ? parts[0] : Buffer.concat(parts, size)));
-    req.on('error', reject);
-    req.on('aborted', () => reject(new HttpError(400, 'Request aborted')));
+  return new Promise((resolve, reject) => readBodyCallback(req, (error, body) => error ? reject(error) : resolve(body!)));
+}
+
+export function readBodyCallback(req: IncomingMessage, callback: (error: unknown, body?: Buffer) => void): void {
+  const parts: Buffer[] = [];
+  let size = 0, finished = false;
+  const fail = (error: unknown) => {
+    if (finished) return;
+    finished = true;
+    parts.length = 0;
+    callback(error);
+  };
+  req.on('data', (part: Buffer) => {
+    if (finished) return;
+    size += part.length;
+    if (size > 32 * 1024 * 1024) fail(new HttpError(413, 'Request body too large'));
+    else parts.push(part);
   });
+  req.on('end', () => {
+    if (finished) return;
+    finished = true;
+    callback(null, parts.length === 1 ? parts[0] : Buffer.concat(parts, size));
+  });
+  req.on('error', fail);
+  req.on('aborted', () => fail(new HttpError(400, 'Request aborted')));
 }
 
 export function parseJson(data: Buffer): any {

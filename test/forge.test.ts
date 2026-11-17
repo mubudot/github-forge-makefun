@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { deflateSync } from 'node:zlib';
+import { createServer } from 'node:http';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createApp } from '../app.ts';
 import { ObjectDatabase, hashObject, sha1 } from '../src/git/objects.ts';
 import { readPack, writePack } from '../src/git/pack.ts';
@@ -101,5 +104,89 @@ test('malformed HTTP requests stay contained and do not interrupt later requests
     app.closeAllConnections();
     await new Promise<void>(resolve => app.close(() => resolve()));
     if (originalToken === undefined) delete process.env.MAKEFUN_SHOP_TOKEN; else process.env.MAKEFUN_SHOP_TOKEN = originalToken;
+  }
+});
+
+test('hot routes preserve auth, invalidation, and repository identity after recreation', async () => {
+  const originalToken = process.env.MAKEFUN_SHOP_TOKEN;
+  process.env.MAKEFUN_SHOP_TOKEN = 'local-test-token';
+  const app = createApp();
+  await new Promise<void>(resolve => app.listen(0, '127.0.0.1', resolve));
+  const address = app.address();
+  assert.ok(address && typeof address !== 'string');
+  const base = `http://127.0.0.1:${address.port}/api/v3`;
+  const headers = { authorization: 'Bearer local-test-token', 'content-type': 'application/json' };
+  const request = async (path: string, method = 'GET', body?: any) => {
+    const response = await fetch(base + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    const value = response.status === 204 ? (await response.arrayBuffer(), null) : await response.json();
+    return { status: response.status, value };
+  };
+  try {
+    const repo = '/repos/mubudot/hot-route-test';
+    assert.equal((await request('/user/repos', 'POST', { name: 'hot-route-test' })).status, 201);
+    const title = 'Quotes " and newline\nwith Unicode: é猫';
+    const created = await request(repo + '/issues', 'POST', { title, body: 'Unicode bytes: λ猫' });
+    assert.equal(created.status, 201);
+    const path = repo + '/issues/1';
+    assert.deepEqual((await request(path)).value, created.value);
+    const unauthorized = await fetch(base + path);
+    assert.equal(unauthorized.status, 401); await unauthorized.arrayBuffer();
+    assert.equal((await request('/repos/other-owner/hot-route-test/issues/1')).status, 404);
+    assert.equal((await request(path, 'PATCH', { state: 'closed', title: 'Updated' })).status, 200);
+    const changed = (await request(path)).value;
+    assert.equal(changed.state, 'closed'); assert.equal(changed.title, 'Updated');
+    assert.equal((await request(path + '/comments', 'POST', { body: 'A comment' })).status, 201);
+    assert.equal((await request(path)).value.comments, 1);
+    assert.equal((await request(repo, 'DELETE')).status, 204);
+    assert.equal((await request(path)).status, 404);
+    assert.equal((await request('/user/repos', 'POST', { name: 'hot-route-test' })).status, 201);
+    assert.equal((await request(path)).status, 404);
+    const replacement = await request(repo + '/issues', 'POST', { title: 'Replacement' });
+    assert.notEqual(replacement.value.id, created.value.id);
+    assert.equal((await request(path)).value.title, 'Replacement');
+  } finally {
+    app.closeAllConnections();
+    await new Promise<void>(resolve => app.close(() => resolve()));
+    if (originalToken === undefined) delete process.env.MAKEFUN_SHOP_TOKEN; else process.env.MAKEFUN_SHOP_TOKEN = originalToken;
+  }
+});
+
+test('the lifecycle retries registration and malformed polls, then exits only on done', { timeout: 12000 }, async () => {
+  let registrations = 0, polls = 0, health = false;
+  const env = createServer((req, res) => {
+    if (req.url === '/register') {
+      const chunks: Buffer[] = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        registrations++;
+        if (registrations === 1) { res.writeHead(503); res.end('{}'); return; }
+        const { port } = JSON.parse(Buffer.concat(chunks).toString());
+        void fetch(`http://127.0.0.1:${port}/healthz`).then(async response => {
+          health = response.status === 200 && (await response.json()).ok === true;
+          res.end('{}');
+        });
+      });
+    } else {
+      polls++;
+      res.end(polls === 1 ? '{"done":false}' : polls === 2 ? '{invalid' : '{"done":true}');
+    }
+  });
+  await new Promise<void>(resolve => env.listen(0, '127.0.0.1', resolve));
+  const address = env.address();
+  assert.ok(address && typeof address !== 'string');
+  const child = spawn(process.execPath, [fileURLToPath(new URL('../main.ts', import.meta.url))], {
+    env: { ...process.env, MAKEFUN_ENV_URL: `http://127.0.0.1:${address.port}`, MAKEFUN_SHOP_TOKEN: 'local-test-token' },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  try {
+    const code = await new Promise<number | null>((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
+    assert.equal(code, 0, stderr);
+    assert.equal(registrations, 2); assert.equal(polls, 3); assert.equal(health, true);
+  } finally {
+    child.kill();
+    env.closeAllConnections();
+    await new Promise<void>(resolve => env.close(() => resolve()));
   }
 });

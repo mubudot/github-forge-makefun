@@ -3,6 +3,8 @@ import { readPack } from './pack.ts';
 import { parsePackets, pkt, FLUSH, sideband } from './pktline.ts';
 import type { Repo } from '../store.ts';
 
+const reportCache = new Map<string, Buffer>();
+
 export function receivePack(repo: Repo, body: Buffer): Buffer {
   const { lines, offset } = parsePackets(body, true);
   const capabilities = lines[0]?.split('\0')[1] ?? '';
@@ -17,21 +19,28 @@ export function receivePack(repo: Repo, body: Buffer): Buffer {
   } catch {
     unpack = 'invalid pack';
   }
-  const reports = [pkt(`unpack ${unpack}\n`)];
+  const reports = [`unpack ${unpack}\n`];
   for (const { oldOid, newOid, ref } of commands) {
     const current = repo.refs.get(ref) ?? ZERO;
     let reason = unpack === 'ok' ? '' : 'unpacker error';
     if (!reason && current !== oldOid) reason = 'stale info';
     if (!reason && newOid !== ZERO && !repo.db.objects.has(newOid)) reason = 'missing object';
     if (!reason && current !== ZERO && newOid !== ZERO && !repo.db.isAncestor(current, newOid)) reason = 'non-fast-forward';
-    if (reason) reports.push(pkt(`ng ${ref} ${reason}\n`));
+    if (reason) reports.push(`ng ${ref} ${reason}\n`);
     else {
       if (newOid === ZERO) repo.refs.delete(ref); else repo.refs.set(ref, newOid);
       repo.fetchCache.clear();
-      reports.push(pkt(`ok ${ref}\n`));
+      reports.push(`ok ${ref}\n`);
     }
   }
-  reports.push(FLUSH);
-  const result = Buffer.concat(reports);
-  return capabilities.includes('side-band-64k') ? Buffer.concat(sideband(result)) : result;
+  const banded = capabilities.includes('side-band-64k');
+  const key = `${banded ? 1 : 0}:${reports.join('')}`;
+  let result = reportCache.get(key);
+  if (!result) {
+    const payload = Buffer.concat([...reports.map(pkt), FLUSH]);
+    result = banded ? Buffer.concat(sideband(payload)) : payload;
+    if (reportCache.size >= 128) reportCache.delete(reportCache.keys().next().value!);
+    reportCache.set(key, result);
+  }
+  return result;
 }

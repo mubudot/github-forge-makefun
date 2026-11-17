@@ -6,7 +6,7 @@ export type Comment = { id: number; node_id: string; body: string; created_at: s
 export type Issue = {
   id: number; node_id: string; number: number; title: string; body: string; state: string;
   labels: Label[]; created_at: string; updated_at: string; closed_at: string | null;
-  comments: Comment[]; serialized?: Buffer;
+  comments: Comment[]; serialized?: string; serializedBytes?: number;
 };
 export type Pull = {
   id: number; node_id: string; number: number; title: string; body: string; state: string;
@@ -126,6 +126,14 @@ export class Store {
     return { id: issue.id, node_id: issue.node_id, number: issue.number, title: issue.title, body: issue.body, state: issue.state,
       labels: issue.labels, user: this.user(), created_at: issue.created_at, updated_at: issue.updated_at, closed_at: issue.closed_at,
       comments: issue.comments.length };
+  }
+
+  issueJson(issue: Issue): string {
+    if (issue.serialized === undefined) {
+      issue.serialized = JSON.stringify(this.issueView(issue));
+      issue.serializedBytes = Buffer.byteLength(issue.serialized);
+    }
+    return issue.serialized;
   }
 
   patchIssue(repo: Repo, issue: Issue, input: any): Issue {

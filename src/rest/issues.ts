@@ -20,8 +20,8 @@ export function issueRoutes(store: Store, repo: Repo, method: string, tail: stri
   if (!issue) throw new HttpError(404, 'Not Found');
   if (tail.length === 2) {
     if (method === 'GET') {
-      issue.serialized ??= Buffer.from(JSON.stringify(store.issueView(issue)));
-      send(res, 200, issue.serialized, 'application/json; charset=utf-8');
+      const body = store.issueJson(issue);
+      send(res, 200, body, 'application/json; charset=utf-8', undefined, issue.serializedBytes);
     } else if (method === 'PATCH') json(res, 200, store.issueView(store.patchIssue(repo, issue, body)));
     else return false;
     return true;

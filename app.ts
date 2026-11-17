@@ -8,6 +8,7 @@ import { issueRoutes } from './src/rest/issues.ts';
 import { pullRoutes } from './src/rest/pulls.ts';
 import { execute } from './src/graphql/executor.ts';
 import { mcp, rpcError } from './src/mcp.ts';
+import { fastRouter } from './src/fast.ts';
 
 type Route = { url: URL; parts: string[]; git: RegExpExecArray | null };
 
@@ -82,8 +83,11 @@ async function dispatch(store: Store, routes: Map<string, Route>, req: IncomingM
 export function createApp(): Server {
   const store = new Store();
   const routes = new Map<string, Route>();
+  const fast = fastRouter(store);
   const server = createServer({ noDelay: true, keepAlive: true }, (req, res) => {
     res.sendDate = false;
+    try { if (fast(req, res)) return; }
+    catch { json(res, 400, { message: 'Invalid request' }); return; }
     void dispatch(store, routes, req, res).catch((error: unknown) => {
       if (error instanceof HttpError) json(res, error.status, { message: error.message });
       else json(res, 400, { message: 'Invalid request' });

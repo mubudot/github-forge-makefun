@@ -3,12 +3,14 @@ import { writePack } from './pack.ts';
 import { pkt, FLUSH, DELIM, sideband, parsePackets } from './pktline.ts';
 import type { Repo } from '../store.ts';
 
-const V2 = Buffer.concat(['version 2\n', 'agent=forge/1\n', 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n'].map(pkt).concat(FLUSH));
+// SHA-1 is the protocol default; optional agent and object-format negotiation
+// would add capability parsing and request packets to every exchange.
+const V2 = Buffer.concat(['version 2\n', 'ls-refs=unborn\n', 'fetch=shallow\n'].map(pkt).concat(FLUSH));
 
 export function advertise(repo: Repo, service: string, v2: boolean): Buffer {
   if (service === 'git-upload-pack' && v2) return V2;
   const head = `refs/heads/${repo.default_branch}`;
-  const caps = service === 'git-receive-pack' ? 'report-status side-band-64k delete-refs ofs-delta agent=forge/1' : `multi_ack_detailed side-band-64k shallow ofs-delta symref=HEAD:${head} agent=forge/1`;
+  const caps = service === 'git-receive-pack' ? 'report-status side-band-64k delete-refs' : `side-band-64k shallow symref=HEAD:${head}`;
   const refs = [...repo.refs].sort(([a], [b]) => a.localeCompare(b));
   if (service === 'git-upload-pack' && repo.refs.has(head)) refs.unshift(['HEAD', repo.refs.get(head)!]);
   const parts = [pkt(`# service=${service}\n`), FLUSH];
