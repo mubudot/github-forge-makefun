@@ -53,6 +53,35 @@ test('thin packs use external bases, and damaged packs expose no new objects', (
   assert.deepEqual(db.get(hashObject('blob', target)).data, target);
 });
 
+test('pack inflation validates stream endings and sizes, then recovers after errors', () => {
+  const data = Buffer.from('Pack validation must survive a rejected stream.\n');
+  const compressed = deflateSync(data);
+  const damaged = Buffer.from(compressed); damaged[damaged.length - 1] ^= 1;
+  const record = (size: number, bytes: Buffer) => Buffer.concat([header(3, size), bytes]);
+  const good = record(data.length, compressed);
+  for (const bad of [
+    record(data.length, damaged),
+    record(data.length, compressed.subarray(0, -2)),
+    record(data.length - 1, compressed),
+    record(data.length + 1, compressed),
+    record(data.length, deflateSync(data, { dictionary: data })),
+  ]) {
+    const db = new ObjectDatabase();
+    // The outer pack checksum is valid: rejection must come from its contents.
+    assert.throws(() => readPack(pack([good, bad]), db));
+    assert.equal(db.objects.size, 0);
+    readPack(pack([good]), db);
+    assert.deepEqual(db.get(hashObject('blob', data)).data, data);
+  }
+  for (const bytes of [Buffer.alloc(0), Buffer.alloc(131072, 119), data]) {
+    for (const level of [0, 1, 9]) {
+      const db = new ObjectDatabase();
+      readPack(pack([record(bytes.length, deflateSync(bytes, { level }))]), db);
+      assert.deepEqual(db.get(hashObject('blob', bytes)).data, bytes);
+    }
+  }
+});
+
 test('GraphQL handles aliases, named fragments, defaults, directives, and mutation parity', () => {
   const store = new Store();
   store.login = 'mubudot';

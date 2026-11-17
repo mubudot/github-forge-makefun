@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, hash } from 'node:crypto';
 
 export type ObjectType = 'commit' | 'tree' | 'blob' | 'tag';
 export type GitObject = { type: ObjectType; data: Buffer; packed?: Buffer };
@@ -8,7 +8,7 @@ export const ZERO = '0'.repeat(40);
 export const isOid = (s: string): boolean => /^[0-9a-f]{40}$/.test(s);
 
 export function sha1(data: Buffer): Buffer {
-  return createHash('sha1').update(data).digest();
+  return hash('sha1', data, 'buffer');
 }
 
 export function hashObject(type: ObjectType, data: Buffer): string {

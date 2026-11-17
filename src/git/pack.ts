@@ -1,9 +1,48 @@
-import { deflateSync, inflateSync } from 'node:zlib';
+import { createInflate, constants, deflateSync, inflateSync } from 'node:zlib';
 import { hashObject, sha1, type GitObject, type ObjectDatabase, type ObjectType } from './objects.ts';
 
 const types: Record<number, ObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 const codes = { commit: 1, tree: 2, blob: 3, tag: 4 };
 const MAX_OBJECT = 16 * 1024 * 1024;
+
+type Inflater = ReturnType<typeof createInflate> & {
+  _handle: { writeSync(...args: unknown[]): void; onerror: (message: string) => void } | null;
+  _writeState: Uint32Array;
+};
+let inflater: Inflater | undefined;
+let inflateError: Error | undefined;
+const captureInflateError = (message: string) => { inflateError = new Error(message); };
+
+/** Reuse one synchronous Node 22 zlib context; one spare byte detects overruns. */
+function inflateEntry(input: Buffer, size: number): { data: Buffer; consumed: number } {
+  if (!inflater) {
+    inflater = createInflate() as Inflater;
+    inflater.on('error', () => {});
+  }
+  const engine = inflater;
+  if (typeof engine._handle?.writeSync !== 'function' || !(engine._writeState instanceof Uint32Array) || engine._writeState.length < 2) {
+    const result = inflateSync(input, { info: true, maxOutputLength: Math.max(1, size), chunkSize: Math.max(64, Math.min(size, 65536)) }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    return { data: result.buffer, consumed: result.engine.bytesWritten };
+  }
+  const data = Buffer.allocUnsafe(size + 1);
+  inflateError = undefined;
+  // Capture synchronous native errors; a rejected context is closed below.
+  const handle = engine._handle;
+  handle.onerror = captureInflateError;
+  try {
+    engine.reset();
+    handle.writeSync(constants.Z_FINISH, input, 0, input.length, data, 0, data.length);
+    if (inflateError) throw inflateError;
+    if (data.length - engine._writeState[0] !== size) throw new Error('Pack object size mismatch');
+    const consumed = input.length - engine._writeState[1];
+    if (consumed <= 0) throw new Error('Invalid compressed pack object');
+    return { data: data.subarray(0, size), consumed };
+  } catch (error) {
+    inflater = undefined;
+    engine.close();
+    throw error;
+  }
+}
 
 function entryHeader(code: number, size: number): Buffer {
   const out: number[] = [];
@@ -97,10 +136,10 @@ export function readPack(pack: Buffer, db: ObjectDatabase): void {
       baseOid = pack.toString('hex', pos, pos + 20);
       pos += 20;
     } else if (!types[code]) throw new Error('Invalid pack object type');
-    const result = inflateSync(pack.subarray(pos, end), { info: true, maxOutputLength: Math.max(1, size), chunkSize: Math.max(64, Math.min(size, 65536)) }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
-    pos += result.engine.bytesWritten;
-    if (result.buffer.length !== size) throw new Error('Pack object size mismatch');
-    const entry: Entry = { offset, code, data: result.buffer, baseOffset, baseOid };
+    const result = inflateEntry(pack.subarray(pos, end), size);
+    pos += result.consumed;
+    if (result.data.length !== size) throw new Error('Pack object size mismatch');
+    const entry: Entry = { offset, code, data: result.data, baseOffset, baseOid };
     if (types[code]) {
       entry.object = { type: types[code], data: entry.data, packed: Buffer.from(pack.subarray(offset, pos)) };
       entry.oid = hashObject(entry.object.type, entry.data);

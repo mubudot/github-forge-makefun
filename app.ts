@@ -84,7 +84,8 @@ export function createApp(): Server {
   const store = new Store();
   const routes = new Map<string, Route>();
   const fast = fastRouter(store);
-  const server = createServer({ noDelay: true, keepAlive: true }, (req, res) => {
+  // HTTP persistence uses the timeout below; kernel TCP probes add setup calls.
+  const server = createServer({ noDelay: true }, (req, res) => {
     res.sendDate = false;
     try { if (fast(req, res)) return; }
     catch { json(res, 400, { message: 'Invalid request' }); return; }
