@@ -1,4 +1,5 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createTransport, type BufferedServer } from './src/transport.ts';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { HttpError, authorized, json, send, readBody, parseJson, objectBody, page } from './src/http.ts';
 import { Store } from './src/store.ts';
 import { advertise, uploadPack } from './src/git/upload-pack.ts';
@@ -80,12 +81,12 @@ async function dispatch(store: Store, routes: Map<string, Route>, req: IncomingM
   throw new HttpError(404, 'Not Found');
 }
 
-export function createApp(): Server {
+export function createApp(): BufferedServer {
   const store = new Store();
   const routes = new Map<string, Route>();
   const fast = fastRouter(store);
-  // HTTP persistence uses the timeout below; kernel TCP probes add setup calls.
-  const server = createServer({ noDelay: true }, (req, res) => {
+  // The transport keeps HTTP connections warm without kernel TCP probes.
+  const server = createTransport((req, res) => {
     res.sendDate = false;
     try { if (fast(req, res)) return; }
     catch { json(res, 400, { message: 'Invalid request' }); return; }
@@ -94,7 +95,5 @@ export function createApp(): Server {
       else json(res, 400, { message: 'Invalid request' });
     });
   });
-  server.keepAliveTimeout = 65000;
-  server.headersTimeout = 70000;
   return server;
 }

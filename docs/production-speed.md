@@ -157,3 +157,62 @@ Before interpreting a small improvement as production points, repeat an A/B
 comparison on a quiet host matching the production architecture and container
 quotas. A useful next experiment is an HTTP responder latency floor measured
 through the same env client and netstack.
+
+
+## Real VM follow-up: buffered HTTP transport
+
+The operator's InstaBox VM runs Docker with runsc-netstack, four host vCPUs,
+an entry limited to two CPUs / 1 GiB and a client limited to two CPUs / 256 MiB.
+The runner imports the kit's original workload functions, yielding only between
+warm-up and timed rounds. Each variant gets five warm-ups and 25 interleaved
+rounds per job, with persistent client pools and alternating orders. The desktop
+is paused. No machine was created or deleted.
+
+The retained transport buffers ordinary HTTP/1.1 requests and responses over
+`net.Socket`. It reuses matching request headers and response prefixes, emits
+one response write, and replaces per-request idle timer refreshes with one shared
+sweep. Node HTTP handles uncommon framing, including chunked requests, on the
+same socket, handler and store. Full issue JSON and the lifecycle are unchanged.
+Backpressure delays the next pipelined request. Focused socket tests cover
+fragmentation, Unicode, pipelining, chunked fallback and large buffered replies.
+
+Ratios below are medians of round-matched candidate/d081ea1 times, in workload
+order push / clone / read / write; smaller is faster:
+
+| Retained transport job | Push | Clone | Read | Write | Geo |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Three-entry comparison, 25 rounds | .934 | 1.159 | .946 | 1.044 | 1.017 |
+| Two-entry repeat, 25 rounds | .892 | .934 | .853 | .895 | .893 |
+| Two-entry confirmation, 25 rounds | 1.025 | .890 | 1.012 | .967 | .973 |
+| All 75 paired rounds pooled | .956 | .923 | .931 | .967 | .944 |
+
+The pooled bootstrap interval is .913–.981, conditional on these observations;
+shared host drift and the inconsistent individual jobs remain material limits.
+This supports a modest improvement, not the requested 12% or a production score
+claim. Applying the pooled ratio to the submitted 454 ms / 141-point result
+suggests about 425–430 ms / 145–146 speed points. Production must confirm it.
+
+Smaller issue replies did not establish an extra gain. Brief active polling
+was substantially slower; a 32 MiB V8 nursery did not help. Both were discarded,
+and no new ideas were pursued after those two failures. The entry keeps its
+existing Node flags. Every measured variant and raw result is recorded locally
+in the untracked `.gv/rig-results/` directory.
+
+A separate Node CPU profile of exact client timed windows found idle wall
+samples of 61–65% for serial workloads and 20% for clone. These samples include
+network and scheduling waits and are not CPU accounting. Profiling adds overhead
+and its times are excluded from the performance comparison. Per-container
+monotonic clocks differ, so no synchronized server/client split is inferred.
+
+Both final Docker grades pass 120/120 checks, feature 600 and agent 200, with
+matching replays and byte-identical live state exports:
+`a0e98d49854b961230227867235c8615858e006db3763f341ac6154af1445590`.
+
+| Full grade | Push ms | Clone ms | Read ms | Write ms | Perf | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 594.046 | 194.838 | 1308.291 | 221.867 | 145 | 945 |
+| 2 | 421.799 | 139.853 | 865.801 | 202.786 | 167 | 967 |
+
+Peak reported process RSS is 187,788 KiB (183.4 MiB). All nine repository tests
+pass. The faster absolute grade is not used as the production estimate. The
+estimated gain remains under ten production points, so this chunk stops here.

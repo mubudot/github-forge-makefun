@@ -8,6 +8,11 @@ export class HttpError extends Error {
   }
 }
 
+export type BufferedRequest = IncomingMessage & { bufferedBody?: Buffer };
+export type BufferedWriter = {
+  sendBuffered(status: number, data: string | Buffer, type: string, length: number, id: number, headers?: Record<string, string>): void;
+};
+
 let requestId = 0;
 export const JSON_TYPE = 'application/json; charset=utf-8';
 const responseHeaders = ['content-type', '', 'content-length', '', 'x-github-request-id', ''];
@@ -18,6 +23,11 @@ export function json(res: ServerResponse, status: number, body: unknown, headers
 
 export function send(res: ServerResponse, status: number, data: string | Buffer, type: string, headers?: Record<string, string>, length?: number): void {
   if (res.destroyed || res.writableEnded) return;
+  const writer = res as ServerResponse & Partial<BufferedWriter>;
+  if (writer.sendBuffered) {
+    writer.sendBuffered(status, data, type, length ?? Buffer.byteLength(data), ++requestId, headers);
+    return;
+  }
   responseHeaders[1] = type;
   responseHeaders[3] = String(length ?? Buffer.byteLength(data));
   responseHeaders[5] = (++requestId).toString(16);
@@ -38,6 +48,8 @@ export function readBody(req: IncomingMessage): Promise<Buffer> {
 }
 
 export function readBodyCallback(req: IncomingMessage, callback: (error: unknown, body?: Buffer) => void): void {
+  const buffered = (req as BufferedRequest).bufferedBody;
+  if (buffered !== undefined) { callback(null, buffered); return; }
   const parts: Buffer[] = [];
   let size = 0, finished = false;
   const fail = (error: unknown) => {

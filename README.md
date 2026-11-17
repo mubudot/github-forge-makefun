@@ -12,6 +12,8 @@ Built by **Ethan Moore (mubudot)**.
 
 - `main.ts` handles registration and completion polling. `app.ts`, `src/http.ts`, and `src/fast.ts`
   provide authenticated HTTP routing, JSON errors, request IDs, and synchronous hot routes.
+  `src/transport.ts` serves buffered HTTP/1.1 exchanges over TCP, with Node HTTP handling
+  uncommon request framing in the same process and store.
 - `src/store.ts` shares repositories, deterministic IDs, issues, labels, comments, and pulls across
   REST v3, GraphQL v4, and MCP. `src/rest/` implements branches, commits, contents, issue workflows,
   pull files, and squash merges with conflict detection per file.
@@ -24,15 +26,16 @@ Built by **Ethan Moore (mubudot)**.
 The performance design caches parsed routes, serialized issue reads, compressed Git objects,
 fetch replies, and report-status packets. Pack decoding reuses a synchronous inflater and uses
 one-shot SHA-1 checksums. Hot routes cache the expected bearer header and avoid
-per-request URL parsing. Responses use one `res.end()` with known content lengths; Node's corking
-coalesces header/body writes. HTTP keep-alive uses a 65-second idle timeout, with TCP_NODELAY. Optional Git negotiation is
+per-request URL parsing. The transport reuses identical request headers and response prefixes,
+sends each buffered reply in one socket write with a content length, and uses a shared idle sweep.
+HTTP keep-alive advertises 65 seconds, with TCP_NODELAY. Optional Git negotiation is
 kept small. Mutations invalidate caches, and timestamps derive from `MAKEFUN_TRIAL_NOW`.
 
 All 120 conformance checks, including 15 MCP checks, pass with matching replay exports. Submitted
 revision d081ea1 scored feature 600, agent 200, and speed 141 in production. Local process grades
 reached 200 speed points; a local gVisor baseline scored 132–139, showing why sandbox measurements
-matter. The latest tuning establishes a small reduction in pack decoding cost; production speed
-still needs a new production grade. [Measurement notes](docs/production-speed.md) describe the
+matter. Real gVisor comparisons of the buffered transport across 75 paired rounds measured a 5.6%
+geomean improvement against d081ea1; production speed still needs a new production grade. [Measurement notes](docs/production-speed.md) describe the
 sealed workloads, syscall counts, discarded experiments, and repeatable profiling commands.
 
 The forge implements a bounded API subset with no persistence, UI, multi-user administration, or
