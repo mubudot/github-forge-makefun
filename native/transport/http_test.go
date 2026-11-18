@@ -43,6 +43,25 @@ func TestRejectAmbiguousFraming(t *testing.T) {
 		}
 	}
 }
+
+func TestResponseHeadersAndPersistentFraming(t *testing.T) {
+	for _, contentType := range []string{"", "application/json", "application/x-git-upload-pack-advertisement", "application/x-git-receive-pack-result"} {
+		frame := AppendResponse(nil, Response{Status: 200, Type: contentType, Body: []byte("body")}, false)
+		r, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(frame)), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Body.Close()
+		body, err := io.ReadAll(r.Body)
+		if err != nil || string(body) != "body" || r.ContentLength != 4 || r.Close {
+			t.Fatalf("invalid persistent response: %+v, body %q, err %v", r, body, err)
+		}
+		wantID := contentType == "" || contentType == "application/json"
+		if gotID := r.Header.Get("X-GitHub-Request-Id") != ""; gotID != wantID {
+			t.Fatalf("request ID for %s: got %v, want %v", contentType, gotID, wantID)
+		}
+	}
+}
 func TestServerCoalescesPipelineAndHandlesBackpressure(t *testing.T) {
 	for _, mode := range []string{"blocking", "netpoll"} {
 		t.Run(mode, func(t *testing.T) {

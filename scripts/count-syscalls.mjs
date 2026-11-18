@@ -1,5 +1,5 @@
 // Count syscall entries inside the sealed timed rounds; straced times are diagnostic.
-import { createReadStream, readFileSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { resolve } from 'node:path';
 
@@ -9,13 +9,17 @@ if (!directory || !trace) {
   process.exit(1);
 }
 const root = resolve(directory);
-const phases = JSON.parse(readFileSync(resolve(root, 'phases.json'), 'utf8'));
-const threads = JSON.parse(readFileSync(resolve(root, 'threads.json'), 'utf8'));
+const clientFile = resolve(root, 'client.json');
+const client = existsSync(clientFile) ? JSON.parse(readFileSync(clientFile, 'utf8')) : null;
+const threads = client ? { suite: client.tids } : JSON.parse(readFileSync(resolve(root, 'threads.json'), 'utf8'));
 const ops = { push: 200, clone: 50, read: 2000, write: 200 };
-const windows = [];
-for (const phase of phases) {
-  const match = /\[bench\] (push|clone|read|write) round.*?: ([\d.]+) ms/.exec(phase.line);
-  if (match) windows.push({ workload: match[1], start: phase.time - Number(match[2]) / 1000, end: phase.time });
+const windows = client ? client.rows.map(row => ({ workload: row.workload, start: row.start_epoch, end: row.end_epoch })) : [];
+if (!client) {
+  const phases = JSON.parse(readFileSync(resolve(root, 'phases.json'), 'utf8'));
+  for (const phase of phases) {
+    const match = /\[bench\] (push|clone|read|write) round.*?: ([\d.]+) ms/.exec(phase.line);
+    if (match) windows.push({ workload: match[1], start: phase.time - Number(match[2]) / 1000, end: phase.time });
+  }
 }
 const owner = new Map(Object.entries(threads).flatMap(([service, ids]) => ids.map(tid => [tid, service])));
 const counts = Object.fromEntries(Object.keys(threads).map(s => [s, Object.fromEntries(Object.keys(ops).map(w => [w, {}]))]));

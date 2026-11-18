@@ -58,8 +58,12 @@ func AppendResponse(out []byte, r Response, close bool) []byte {
 		size = 0
 	}
 	out = strconv.AppendInt(out, int64(size), 10)
-	out = append(out, "\r\nX-GitHub-Request-Id: "...)
-	out = strconv.AppendUint(out, requestID.Add(1), 16)
+	// Git's binary protocol does not use REST request IDs. Avoid making its
+	// clients allocate and normalize an extra header for every negotiation RPC.
+	if !strings.HasPrefix(r.Type, "application/x-git-") {
+		out = append(out, "\r\nX-GitHub-Request-Id: "...)
+		out = strconv.AppendUint(out, requestID.Add(1), 16)
+	}
 	out = append(out, "\r\n"...)
 	for k, v := range r.Headers {
 		out = append(out, k...)

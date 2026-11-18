@@ -55,6 +55,8 @@ temporarily remove the ARM64 binary's ignore rule while grading to exercise Go,
 then restore it. Without that override, the grade correctly exercises TypeScript.
 [Native measurement notes](docs/native-speed.md) record native grades, profiling,
 workload comparisons, and the remaining production measurement requirement.
+[Client cost audit](docs/client-cost.md) records the sealed client's wire behavior,
+CPU/GC and syscall measurements, and the limits of the measured improvements.
 
 This is the competition's API subset: it has no persistence, UI, or multi-user
 administration. `FORGE_OWNER_LOGIN` can set its single owner; otherwise the first
