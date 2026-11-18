@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -156,5 +157,58 @@ func TestBlockingThreadLimitUsesNetpollForExtraClients(t *testing.T) {
 		if e != nil || string(b) != `{"ok":true}` {
 			t.Fatalf("client %d: %s %v", i, b, e)
 		}
+	}
+}
+
+func TestSmallSocketWritesPreserveBytesUnderBackpressure(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, reader := &socket{fd: fds[0]}, &socket{fd: fds[1]}
+	defer writer.Close()
+	defer reader.Close()
+	if err := syscall.SetsockoptInt(fds[0], syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4096); err != nil {
+		t.Fatal(err)
+	}
+	// Establish a persistent connection before applying backpressure to its
+	// small replies. Each warm-up is drained before the next write.
+	warm := make([]byte, 1024)
+	for range 8 {
+		if err := writeAll(writer, warm); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(reader, warm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := make([]byte, 256<<10)
+	for i := range want {
+		want[i] = byte(i / 1024)
+	}
+	done := make(chan error, 1)
+	go func() {
+		for at := 0; at < len(want); at += 1024 {
+			if err := writeAll(writer, want[at:at+1024]); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("writer did not encounter backpressure: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(reader, got); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("small replies were lost, duplicated, or reordered")
 	}
 }

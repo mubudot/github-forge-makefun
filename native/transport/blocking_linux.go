@@ -6,15 +6,19 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"unsafe"
 )
 
 // Blocking socket calls release the Go P but skip the readiness probe, EAGAIN
 // retry and epoll cycle on every request. A locked thread owns each descriptor.
 // Extra connections use the netpoller to keep the process below its pid budget.
 type socket struct {
-	fd   int
-	once sync.Once
+	fd        int
+	once      sync.Once
+	lastWrite uint64
+	shortGaps uint8
 }
 
 func (s *socket) Read(b []byte) (int, error) {
@@ -29,7 +33,33 @@ func (s *socket) Read(b []byte) (int, error) {
 		return n, e
 	}
 }
+
+var writeSequence atomic.Uint64
+
 func (s *socket) Write(b []byte) (int, error) {
+	sequence := writeSequence.Add(1)
+	if s.lastWrite != 0 && sequence-s.lastWrite <= 4 {
+		if s.shortGaps < 4 {
+			s.shortGaps++
+		}
+	} else {
+		s.shortGaps = 0
+	}
+	s.lastWrite = sequence
+	// Recently alternating connections can send without relinquishing a Go P.
+	// A concurrent fan-out has longer gaps and keeps the normal blocking path.
+	// MSG_DONTWAIT bounds the fast syscall; backpressure uses the blocking write.
+	if s.shortGaps >= 4 && len(b) > 0 && len(b) <= 4096 {
+		n, _, errno := syscall.RawSyscall6(syscall.SYS_SENDTO, uintptr(s.fd), uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)), syscall.MSG_DONTWAIT|syscall.MSG_NOSIGNAL, 0, 0)
+		runtime.KeepAlive(b)
+		if errno == 0 {
+			return int(n), nil
+		}
+		if errno != syscall.EAGAIN && errno != syscall.EINTR {
+			return int(n), errno
+		}
+	}
+
 	for {
 		n, e := syscall.Write(s.fd, b)
 		if e == syscall.EINTR {

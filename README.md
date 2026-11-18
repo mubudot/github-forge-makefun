@@ -22,8 +22,10 @@ label, pull request, and squash-merge state. IDs and commit timestamps are deter
 The HTTP/1.1 transport uses reusable buffers, content lengths, keep-alive, chunked
 request decoding, TCP_NODELAY, and coalesced pipelined responses. Linux connections
 use blocking reads on dedicated threads, with a bounded thread count and netpoll
-fallback for additional clients. Each buffered response uses one blocking write,
-with partial writes retried under backpressure. There are no per-request socket deadlines.
+fallback for additional clients. Small replies on repeatedly active connections
+use one nonblocking send without releasing a Go processor; concurrent fan-out,
+large replies, and backpressure use blocking writes. Partial writes are retried.
+There are no per-request socket deadlines.
 Serialized issue reads, parsed headers/routes, Git advertisements, compressed objects,
 and fetch replies are cached and invalidated by mutations. Go uses two processors,
 a 600 MiB soft memory limit, and GOGC 500 to leave room for the suite.
@@ -57,6 +59,8 @@ then restore it. Without that override, the grade correctly exercises TypeScript
 workload comparisons, and the remaining production measurement requirement.
 [Client cost audit](docs/client-cost.md) records the sealed client's wire behavior,
 CPU/GC and syscall measurements, and the limits of the measured improvements.
+[Structural transport audit](docs/structural-speed.md) records the adaptive-send
+change, fresh interleaved gVisor trials, and remaining production uncertainty.
 
 This is the competition's API subset: it has no persistence, UI, or multi-user
 administration. `FORGE_OWNER_LOGIN` can set its single owner; otherwise the first
