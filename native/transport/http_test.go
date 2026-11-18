@@ -64,10 +64,13 @@ func TestResponseHeadersAndPersistentFraming(t *testing.T) {
 	}
 }
 func TestServerCoalescesPipelineAndHandlesBackpressure(t *testing.T) {
-	for _, mode := range []string{"blocking", "netpoll"} {
+	for _, mode := range []string{"blocking", "netpoll", "owner"} {
 		t.Run(mode, func(t *testing.T) {
 			body := bytes.Repeat([]byte{'x'}, 256<<10)
 			start := ServeBlocking
+			if mode == "owner" {
+				start = ServeOwner
+			}
 			if mode == "netpoll" {
 				start = ServeNetpoll
 			}

@@ -1,5 +1,5 @@
-// Package transport serves buffered HTTP/1.1. A connection has one goroutine,
-// reusable input/output buffers, and no per-request deadlines or timers.
+// Package transport serves buffered HTTP/1.1 with reusable connection buffers.
+// Its owner loop and comparison transports do not set per-request deadlines.
 package transport
 
 import (

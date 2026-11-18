@@ -1,0 +1,466 @@
+--- a/native/cmd/forge/main.go
++++ b/native/cmd/forge/main.go
+@@ -76,7 +76,7 @@
+ 		defer func() { pprof.StopCPUProfile(); f.Close() }()
+ 	}
+ 	app := api.New(os.Getenv("MAKEFUN_SHOP_TOKEN"))
+-	serve := transport.ServeBlocking
++	serve := transport.ServeOwner
+ 	if os.Getenv("FORGE_TRANSPORT") == "netpoll" {
+ 		serve = transport.ServeNetpoll
+ 	}
+--- a/native/transport/http_test.go
++++ b/native/transport/http_test.go
+@@ -64,10 +64,13 @@
+ 	}
+ }
+ func TestServerCoalescesPipelineAndHandlesBackpressure(t *testing.T) {
+-	for _, mode := range []string{"blocking", "netpoll"} {
++	for _, mode := range []string{"blocking", "netpoll", "owner"} {
+ 		t.Run(mode, func(t *testing.T) {
+ 			body := bytes.Repeat([]byte{'x'}, 256<<10)
+ 			start := ServeBlocking
++			if mode == "owner" {
++				start = ServeOwner
++			}
+ 			if mode == "netpoll" {
+ 				start = ServeNetpoll
+ 			}
+--- /dev/null
++++ b/native/transport/owner_linux.go
+@@ -0,0 +1,348 @@
++package transport
++
++import (
++	"bytes"
++	"io"
++	"os"
++	"runtime"
++	"strings"
++	"sync"
++	"syscall"
++	"unsafe"
++)
++
++// ownerConn is touched only by the event-loop goroutine. Output backpressure
++// pauses input, so one response plus a bounded pipeline is queued per socket.
++type ownerConn struct {
++	fd                 int
++	serial             int32
++	input, out         []byte
++	used, start, sent  int
++	parser             parser
++	continued, closing bool
++	interest           uint32
++}
++
++func rawReadFD(fd int, b []byte) (int, syscall.Errno) {
++	for {
++		n, _, e := syscall.RawSyscall(syscall.SYS_READ, uintptr(fd), uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
++		runtime.KeepAlive(b)
++		if e == syscall.EINTR {
++			continue
++		}
++		return int(n), e
++	}
++}
++func rawSendFD(fd int, b []byte) (int, syscall.Errno) {
++	for {
++		n, _, e := syscall.RawSyscall6(syscall.SYS_SENDTO, uintptr(fd), uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)), syscall.MSG_DONTWAIT|syscall.MSG_NOSIGNAL, 0, 0)
++		runtime.KeepAlive(b)
++		if e == syscall.EINTR {
++			continue
++		}
++		return int(n), e
++	}
++}
++func ownerControl(epfd, op, fd int, flags uint32, serial int32) error {
++	event := syscall.EpollEvent{Events: flags, Fd: int32(fd), Pad: serial}
++	_, _, e := syscall.RawSyscall6(syscall.SYS_EPOLL_CTL, uintptr(epfd), uintptr(op), uintptr(fd), uintptr(unsafe.Pointer(&event)), 0, 0)
++	runtime.KeepAlive(&event)
++	if e != 0 {
++		return e
++	}
++	return nil
++}
++func ownerWait(epfd int, events []syscall.EpollEvent, raw bool) (int, error) {
++	if raw {
++		n, _, e := syscall.RawSyscall6(syscall.SYS_EPOLL_PWAIT, uintptr(epfd), uintptr(unsafe.Pointer(&events[0])), uintptr(len(events)), ^uintptr(0), 0, 8)
++		runtime.KeepAlive(events)
++		if e != 0 {
++			return 0, e
++		}
++		return int(n), nil
++	}
++	return syscall.EpollWait(epfd, events, -1)
++}
++func rawWaitEnabled() bool {
++	for _, field := range strings.Split(os.Getenv("GODEBUG"), ",") {
++		if k, v, ok := strings.Cut(field, "="); ok && k == "asyncpreemptoff" && v != "0" {
++			return false
++		}
++	}
++	return true
++}
++
++func (c *ownerConn) flush() error {
++	for c.sent < len(c.out) {
++		n, e := rawSendFD(c.fd, c.out[c.sent:])
++		if e == syscall.EAGAIN {
++			return nil
++		}
++		if e != 0 {
++			return e
++		}
++		if n == 0 {
++			return io.ErrShortWrite
++		}
++		c.sent += n
++	}
++	c.out = c.out[:0]
++	c.sent = 0
++	if c.closing {
++		return io.EOF
++	}
++	return nil
++}
++func (c *ownerConn) dispatch(h Handler) error {
++	for {
++		r, n, e := c.parser.parse(c.input[c.start:c.used])
++		if e != nil {
++			c.out = AppendResponse(c.out, JSON(400, map[string]any{"message": "Invalid HTTP request"}), true)
++			c.closing = true
++			return c.flush()
++		}
++		if n == 0 {
++			break
++		}
++		c.out = AppendResponse(c.out, h(&r), r.Close)
++		c.start += n
++		c.continued = false
++		if r.Close {
++			c.closing = true
++			return c.flush()
++		}
++		if len(c.out) >= 256<<10 {
++			if e = c.flush(); e != nil {
++				return e
++			}
++			if len(c.out) > 0 {
++				return nil
++			}
++		}
++	}
++	if len(c.out) > 0 {
++		if e := c.flush(); e != nil {
++			return e
++		}
++		if len(c.out) > 0 {
++			return nil
++		}
++	}
++	if !c.continued && bytes.Contains(c.input[c.start:c.used], []byte("\r\n\r\n")) && strings.EqualFold(c.parser.template.Headers["expect"], "100-continue") {
++		c.out = append(c.out, "HTTP/1.1 100 Continue\r\n\r\n"...)
++		c.continued = true
++		return c.flush()
++	}
++	return nil
++}
++func (c *ownerConn) receive(h Handler) error {
++	if c.start > 0 {
++		copy(c.input, c.input[c.start:c.used])
++		c.used -= c.start
++		c.start = 0
++	}
++	if c.used == len(c.input) {
++		if c.used >= MaxBody+maxHeader {
++			c.out = AppendResponse(c.out, JSON(413, map[string]any{"message": "Request body too large"}), true)
++			c.closing = true
++			return c.flush()
++		}
++		c.input = append(c.input, make([]byte, min(len(c.input), MaxBody+maxHeader-c.used))...)
++	}
++	n, e := rawReadFD(c.fd, c.input[c.used:])
++	if e == syscall.EAGAIN {
++		return nil
++	}
++	if e != 0 {
++		return e
++	}
++	if n == 0 {
++		return io.EOF
++	}
++	c.used += n
++	return c.dispatch(h)
++}
++
++// ServeOwner uses one locked thread and level-triggered epoll. Socket I/O is
++// nonblocking. A raw epoll wait retains its P until an event or SIGURG; EINTR
++// switches the next wait to Go's scheduler-aware wrapper, permitting GC/STW.
++// epoll waits are never SA_RESTART-restarted, so signal handlers stay intact.
++func ServeOwner(h Handler) (port int, stop func(), err error) {
++	listener, e := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC|syscall.SOCK_NONBLOCK, syscall.IPPROTO_TCP)
++	if e != nil {
++		return 0, nil, e
++	}
++	epfd, wake := -1, -1
++	success := false
++	defer func() {
++		if !success {
++			syscall.Close(listener)
++			if epfd >= 0 {
++				syscall.Close(epfd)
++			}
++			if wake >= 0 {
++				syscall.Close(wake)
++			}
++		}
++	}()
++	if e = syscall.Bind(listener, &syscall.SockaddrInet4{}); e != nil {
++		return 0, nil, e
++	}
++	if e = syscall.Listen(listener, 128); e != nil {
++		return 0, nil, e
++	}
++	addr, e := syscall.Getsockname(listener)
++	if e != nil {
++		return 0, nil, e
++	}
++	port = addr.(*syscall.SockaddrInet4).Port
++	epfd, e = syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
++	if e != nil {
++		return 0, nil, e
++	}
++	r, _, errno := syscall.Syscall(syscall.SYS_EVENTFD2, 0, syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
++	if errno != 0 {
++		return 0, nil, errno
++	}
++	wake = int(r)
++	if e = ownerControl(epfd, syscall.EPOLL_CTL_ADD, listener, syscall.EPOLLIN, 0); e != nil {
++		return 0, nil, e
++	}
++	if e = ownerControl(epfd, syscall.EPOLL_CTL_ADD, wake, syscall.EPOLLIN, 0); e != nil {
++		return 0, nil, e
++	}
++	var stopOnce sync.Once
++	var mu sync.Mutex
++	done := make(chan struct{})
++	stop = func() {
++		stopOnce.Do(func() {
++			mu.Lock()
++			if wake >= 0 {
++				var value uint64 = 1
++				for {
++					_, _, e := syscall.RawSyscall(syscall.SYS_WRITE, uintptr(wake), uintptr(unsafe.Pointer(&value)), 8)
++					if e != syscall.EINTR {
++						break
++					}
++				}
++				runtime.KeepAlive(&value)
++			}
++			mu.Unlock()
++			<-done
++		})
++	}
++	go func() {
++		runtime.LockOSThread()
++		defer runtime.UnlockOSThread()
++		connections := map[int]*ownerConn{}
++		defer func() {
++			for fd := range connections {
++				syscall.Close(fd)
++			}
++			syscall.Close(listener)
++			syscall.Close(epfd)
++			mu.Lock()
++			syscall.Close(wake)
++			wake = -1
++			mu.Unlock()
++			close(done)
++		}()
++		events := make([]syscall.EpollEvent, 128)
++		var serial int32
++		rawAllowed := rawWaitEnabled()
++		rawNext := rawAllowed
++		closeConn := func(c *ownerConn) { delete(connections, c.fd); syscall.Close(c.fd) }
++		for {
++			n, e := ownerWait(epfd, events, rawNext)
++			if e == syscall.EINTR {
++				rawNext = false
++				continue
++			}
++			if e != nil {
++				return
++			}
++			rawNext = rawAllowed
++			for _, event := range events[:n] {
++				fd := int(event.Fd)
++				if fd == wake {
++					return
++				}
++				if fd == listener {
++					for accepted := 0; accepted < 128; accepted++ {
++						r, _, errno := syscall.RawSyscall6(syscall.SYS_ACCEPT4, uintptr(listener), 0, 0, syscall.SOCK_CLOEXEC|syscall.SOCK_NONBLOCK, 0, 0)
++						client := int(r)
++						var e error
++						if errno != 0 {
++							e = errno
++						}
++						if e == syscall.EINTR {
++							continue
++						}
++						if e == syscall.EAGAIN {
++							break
++						}
++						if e == syscall.ECONNABORTED || e == syscall.EPROTO {
++							continue
++						}
++						if e != nil {
++							return
++						}
++						var one int32 = 1
++						syscall.RawSyscall6(syscall.SYS_SETSOCKOPT, uintptr(client), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, uintptr(unsafe.Pointer(&one)), 4, 0)
++						runtime.KeepAlive(&one)
++						serial++
++						if serial == 0 {
++							serial++
++						}
++						c := &ownerConn{fd: client, serial: serial, input: make([]byte, 8192), out: make([]byte, 0, 4096), interest: syscall.EPOLLIN | syscall.EPOLLRDHUP}
++						if e = ownerControl(epfd, syscall.EPOLL_CTL_ADD, client, c.interest, serial); e != nil {
++							syscall.Close(client)
++							continue
++						}
++						connections[client] = c
++					}
++					continue
++				}
++				c := connections[fd]
++				if c == nil || c.serial != event.Pad {
++					continue
++				}
++				if len(c.out) > 0 {
++					if e = c.flush(); e != nil {
++						closeConn(c)
++						continue
++					}
++					if len(c.out) == 0 {
++						if e = c.dispatch(h); e != nil {
++							closeConn(c)
++							continue
++						}
++					}
++				}
++				if len(c.out) == 0 && event.Events&(syscall.EPOLLIN|syscall.EPOLLRDHUP|syscall.EPOLLHUP) != 0 {
++					if e = c.receive(h); e != nil {
++						closeConn(c)
++						continue
++					}
++				}
++				if event.Events&(syscall.EPOLLERR|syscall.EPOLLHUP) != 0 && len(c.out) == 0 {
++					closeConn(c)
++					continue
++				}
++				interest := uint32(syscall.EPOLLIN | syscall.EPOLLRDHUP)
++				if len(c.out) > 0 {
++					interest = syscall.EPOLLOUT | syscall.EPOLLRDHUP
++				}
++				if interest != c.interest {
++					if e = ownerControl(epfd, syscall.EPOLL_CTL_MOD, fd, interest, c.serial); e != nil {
++						closeConn(c)
++						continue
++					}
++					c.interest = interest
++				}
++			}
++		}
++	}()
++	success = true
++	return port, stop, nil
++}
+--- /dev/null
++++ b/native/transport/owner_test.go
+@@ -0,0 +1,84 @@
++package transport
++
++import (
++	"bufio"
++	"bytes"
++	"io"
++	"net"
++	"net/http"
++	"runtime"
++	"strconv"
++	"testing"
++	"time"
++)
++
++func TestOwnerIdleConnectionsAllowRepeatedGC(t *testing.T) {
++	old := runtime.GOMAXPROCS(2)
++	defer runtime.GOMAXPROCS(old)
++	port, stop, e := ServeOwner(func(*Request) Response { return Response{Status: 200, Body: []byte("ok")} })
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer stop()
++	var active net.Conn
++	for range 20 {
++		c, e := net.Dial("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
++		if e != nil {
++			t.Fatal(e)
++		}
++		defer c.Close()
++		active = c
++	}
++	active.SetDeadline(time.Now().Add(10 * time.Second))
++	reader := bufio.NewReader(active)
++	for range 100 {
++		if _, e = io.WriteString(active, "GET / HTTP/1.1\r\nHost: test\r\n\r\n"); e != nil {
++			t.Fatal(e)
++		}
++		r, e := http.ReadResponse(reader, nil)
++		if e != nil {
++			t.Fatal(e)
++		}
++		b, e := io.ReadAll(r.Body)
++		r.Body.Close()
++		if e != nil || string(b) != "ok" {
++			t.Fatalf("response %q: %v", b, e)
++		}
++		runtime.GC()
++	}
++}
++
++func TestOwnerPipelineResumesAfterSocketBackpressure(t *testing.T) {
++	body := bytes.Repeat([]byte("backpressure:"), 600000)
++	port, stop, e := ServeOwner(func(*Request) Response { return Response{Status: 200, Body: body} })
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer stop()
++	c, e := net.DialTCP("tcp4", nil, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer c.Close()
++	c.SetReadBuffer(65536)
++	c.SetDeadline(time.Now().Add(10 * time.Second))
++	if _, e = io.WriteString(c, "GET / HTTP/1.1\r\nHost: test\r\n\r\nGET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"); e != nil {
++		t.Fatal(e)
++	}
++	time.Sleep(20 * time.Millisecond)
++	reader := bufio.NewReader(c)
++	for range 2 {
++		r, e := http.ReadResponse(reader, nil)
++		if e != nil {
++			t.Fatal(e)
++		}
++		b, e := io.ReadAll(r.Body)
++		r.Body.Close()
++		if e != nil || !bytes.Equal(b, body) {
++			t.Fatalf("large pipeline reply: %d bytes: %v", len(b), e)
++		}
++	}
++	if _, e = reader.ReadByte(); e != io.EOF {
++		t.Fatalf("close response did not close socket: %v", e)
++	}
++}

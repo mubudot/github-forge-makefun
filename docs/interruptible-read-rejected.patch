@@ -1,0 +1,204 @@
+--- a/native/transport/blocking_linux.go
++++ b/native/transport/blocking_linux.go
+@@ -5,6 +5,7 @@
+ 	"net"
+ 	"os"
+ 	"runtime"
++	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"syscall"
+@@ -15,16 +16,37 @@
+ // retry and epoll cycle on every request. A locked thread owns each descriptor.
+ // Extra connections use the netpoller to keep the process below its pid budget.
+ type socket struct {
+-	fd        int
+-	once      sync.Once
+-	lastWrite uint64
+-	shortGaps uint8
+-}
+-
++	fd            int
++	once          sync.Once
++	lastWrite     uint64
++	shortGaps     uint8
++	rawRead       bool
++	shortReadGaps uint8
++}
++
++// An interruptible raw read retains the P until data arrives. SIGURG keeps
++// its Go handler but does not restart the syscall: a preemption signal makes
++// the read return EINTR, then a normal syscall releases the P for GC/scheduling.
+ func (s *socket) Read(b []byte) (int, error) {
++	if len(b) == 0 {
++		return 0, nil
++	}
++	raw := s.rawRead && s.shortReadGaps >= 4
+ 	for {
+-		n, e := syscall.Read(s.fd, b)
++		var n int
++		var e error
++		if raw {
++			r, _, errno := syscall.RawSyscall(syscall.SYS_READ, uintptr(s.fd), uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
++			runtime.KeepAlive(b)
++			n = int(r)
++			if errno != 0 {
++				e = errno
++			}
++		} else {
++			n, e = syscall.Read(s.fd, b)
++		}
+ 		if e == syscall.EINTR {
++			raw = false
+ 			continue
+ 		}
+ 		if n == 0 && e == nil {
+@@ -32,6 +54,41 @@
+ 		}
+ 		return n, e
+ 	}
++}
++
++type signalAction struct {
++	handler  uintptr
++	flags    uint64
++	restorer uintptr
++	mask     uint64
++}
++
++var interruptOnce sync.Once
++var interruptOK bool
++
++func allowInterruptibleReads() bool {
++	interruptOnce.Do(func() {
++		if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
++			return
++		}
++		// Without asynchronous preemption there is no signal to interrupt an
++		// idle read. Keep the ordinary syscall path under that debug setting.
++		for _, field := range strings.Split(os.Getenv("GODEBUG"), ",") {
++			if k, v, ok := strings.Cut(field, "="); ok && k == "asyncpreemptoff" && v != "0" {
++				return
++			}
++		}
++		var action signalAction
++		_, _, err := syscall.RawSyscall6(syscall.SYS_RT_SIGACTION, uintptr(syscall.SIGURG), 0, uintptr(unsafe.Pointer(&action)), 8, 0, 0)
++		if err != 0 || action.handler <= 1 {
++			return
++		}
++		action.flags &^= 0x10000000 // SA_RESTART; retain handler, mask, stack, restorer.
++		_, _, err = syscall.RawSyscall6(syscall.SYS_RT_SIGACTION, uintptr(syscall.SIGURG), uintptr(unsafe.Pointer(&action)), 0, 8, 0, 0)
++		runtime.KeepAlive(&action)
++		interruptOK = err == 0
++	})
++	return interruptOK
+ }
+ 
+ var writeSequence atomic.Uint64
+@@ -44,6 +101,13 @@
+ 		}
+ 	} else {
+ 		s.shortGaps = 0
++	}
++	if s.lastWrite != 0 && sequence-s.lastWrite <= 2 {
++		if s.shortReadGaps < 4 {
++			s.shortReadGaps++
++		}
++	} else {
++		s.shortReadGaps = 0
+ 	}
+ 	s.lastWrite = sequence
+ 	// Recently alternating connections can send without relinquishing a Go P.
+@@ -95,6 +159,7 @@
+ 		return 0, nil, e
+ 	}
+ 	port = addr.(*syscall.SockaddrInet4).Port
++	rawRead := allowInterruptibleReads()
+ 	slots := make(chan struct{}, connectionLimit)
+ 	var mu sync.Mutex
+ 	active := map[*socket]bool{}
+@@ -124,7 +189,7 @@
+ 				return
+ 			}
+ 			syscall.SetsockoptInt(client, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+-			s := &socket{fd: client}
++			s := &socket{fd: client, rawRead: rawRead}
+ 			mu.Lock()
+ 			if stopped {
+ 				mu.Unlock()
+--- /dev/null
++++ b/native/transport/interrupt_test.go
+@@ -0,0 +1,73 @@
++package transport
++
++import (
++	"io"
++	"runtime"
++	"syscall"
++	"testing"
++	"time"
++)
++
++func TestIdleInterruptibleReadAllowsGC(t *testing.T) {
++	old := runtime.GOMAXPROCS(2)
++	defer runtime.GOMAXPROCS(old)
++	if !allowInterruptibleReads() {
++		t.Fatal("interruptible read not available")
++	}
++	started := make(chan struct{}, 2)
++	finished := make(chan error, 2)
++	peers := []*socket{}
++	for range 2 {
++		fds, e := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
++		if e != nil {
++			t.Fatal(e)
++		}
++		reader := &socket{fd: fds[0], rawRead: true, shortReadGaps: 4}
++		writer := &socket{fd: fds[1]}
++		defer reader.Close()
++		defer writer.Close()
++		peers = append(peers, writer)
++		go func() {
++			runtime.LockOSThread()
++			defer runtime.UnlockOSThread()
++			started <- struct{}{}
++			var b [1]byte
++			_, e := io.ReadFull(reader, b[:])
++			finished <- e
++		}()
++	}
++	<-started
++	<-started
++	gcDone := make(chan struct{})
++	go func() {
++		for range 100 {
++			runtime.GC()
++		}
++		close(gcDone)
++	}()
++	select {
++	case <-gcDone:
++	case <-time.After(3 * time.Second):
++		t.Fatal("GC stalled behind idle raw read")
++	}
++	select {
++	case e := <-finished:
++		t.Fatalf("idle read returned: %v", e)
++	default:
++	}
++	for _, s := range peers {
++		if _, e := s.Write([]byte("x")); e != nil {
++			t.Fatal(e)
++		}
++	}
++	for range peers {
++		select {
++		case e := <-finished:
++			if e != nil {
++				t.Fatal(e)
++			}
++		case <-time.After(time.Second):
++			t.Fatal("read did not resume")
++		}
++	}
++}

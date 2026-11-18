@@ -76,7 +76,7 @@ func run() error {
 		defer func() { pprof.StopCPUProfile(); f.Close() }()
 	}
 	app := api.New(os.Getenv("MAKEFUN_SHOP_TOKEN"))
-	serve := transport.ServeBlocking
+	serve := transport.ServeOwner
 	if os.Getenv("FORGE_TRANSPORT") == "netpoll" {
 		serve = transport.ServeNetpoll
 	}

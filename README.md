@@ -20,12 +20,16 @@ fast-forward reports. REST v3, GraphQL v4, and MCP share repository, issue, comm
 label, pull request, and squash-merge state. IDs and commit timestamps are deterministic.
 
 The HTTP/1.1 transport uses reusable buffers, content lengths, keep-alive, chunked
-request decoding, TCP_NODELAY, and coalesced pipelined responses. Linux connections
-use blocking reads on dedicated threads, with a bounded thread count and netpoll
-fallback for additional clients. Small replies on repeatedly active connections
-use one nonblocking send without releasing a Go processor; concurrent fan-out,
-large replies, and backpressure use blocking writes. Partial writes are retried.
-There are no per-request socket deadlines.
+request decoding, TCP_NODELAY, and coalesced pipelined responses. On Linux, one
+locked thread owns the nonblocking sockets and level-triggered epoll. Partial
+writes pause input until EPOLLOUT can drain them; half-closed clients retain their
+queued responses. A raw readiness wait keeps its Go processor until an event or
+preemption signal. An interrupted wait passes through the Go scheduler so idle
+keep-alive sockets cannot prevent GC. Disabling asynchronous preemption, or using
+one Go processor, selects scheduler-aware waits throughout. Signal handlers stay
+unchanged, and there are no per-request socket deadlines. Failed accepts use a
+bounded backoff under descriptor or memory pressure. Any owner-loop setup failure
+closes its descriptors and automatically starts the existing blocking transport.
 Serialized issue reads, parsed headers/routes, Git advertisements, compressed objects,
 and fetch replies are cached and invalidated by mutations. Go uses two processors,
 a 600 MiB soft memory limit, and GOGC 500 to leave room for the suite.
@@ -49,7 +53,9 @@ The build uses `CGO_ENABLED=0 GOOS=linux`, `-trimpath`, and
 `-ldflags="-s -w -buildid="`, with VCS stamping disabled. Both outputs are static ELF
 executables and can be built without network access. The entry needs no writable
 repository. `FORGE_TS_FALLBACK=1` selects TypeScript for local comparison;
-`FORGE_TRANSPORT=netpoll` selects the Go comparison transport.
+`FORGE_TRANSPORT=netpoll` selects the Go comparison transport. The launcher preserves
+a received SIGTERM/SIGINT exit status when a simultaneous `/done` reply lets the
+native child finish normally before the forwarded signal arrives.
 
 For local grading, run the kit's `grade-local --kit . --bot <this directory>
 --driver process --worktree`. On ARM64, its snapshot excludes ignored files:
@@ -61,6 +67,11 @@ workload comparisons, and the remaining production measurement requirement.
 CPU/GC and syscall measurements, and the limits of the measured improvements.
 [Structural transport audit](docs/structural-speed.md) records the adaptive-send
 change, fresh interleaved gVisor trials, and remaining production uncertainty.
+[Interruptible wait audit](docs/interruptible-wait.md) records the final owner-loop
+decision: 40 new pinned/candidate pairs and 64 pooled confirmation pairs on two
+shared gVisor CPUs. The pooled arithmetic-mean geomean ratio is 0.944
+[0.890, 0.994], meeting the agreed retention rule. The new batch alone is 0.967
+[0.931, 1.003]; production transfer remains unmeasured.
 
 This is the competition's API subset: it has no persistence, UI, or multi-user
 administration. `FORGE_OWNER_LOGIN` can set its single owner; otherwise the first

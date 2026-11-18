@@ -30,8 +30,13 @@ async function launch(): Promise<void> {
   try { checkExecutable(executable, arch); }
   catch (error) { await fallback(error); return; }
   const child = spawn(executable, [], { env: process.env, stdio: 'inherit' });
-  const term = () => child.kill('SIGTERM');
-  const interrupt = () => child.kill('SIGINT');
+  let requestedSignal: 'SIGTERM' | 'SIGINT' | undefined;
+  const forward = (signal: 'SIGTERM' | 'SIGINT') => {
+    requestedSignal ??= signal;
+    child.kill(signal);
+  };
+  const term = () => forward('SIGTERM');
+  const interrupt = () => forward('SIGINT');
   process.on('SIGTERM', term);
   process.on('SIGINT', interrupt);
   const cleanup = () => { process.off('SIGTERM', term); process.off('SIGINT', interrupt); };
@@ -44,8 +49,16 @@ async function launch(): Promise<void> {
     });
     child.once('exit', (code, signal) => {
       if (failed) return;
-      cleanup();
-      process.exit(code ?? (signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 1));
+      // A /done reply can let the child exit normally before it receives the
+      // forwarded signal. Preserve the parent's received signal in that race,
+      // and let already queued signal callbacks run before finalizing exit.
+      setImmediate(() => {
+        cleanup();
+        const finalSignal = requestedSignal ?? signal;
+        process.exit(requestedSignal
+          ? (requestedSignal === 'SIGINT' ? 130 : 143)
+          : code ?? (finalSignal === 'SIGINT' ? 130 : finalSignal === 'SIGTERM' ? 143 : 1));
+      });
     });
   });
 }
