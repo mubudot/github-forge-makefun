@@ -20,11 +20,13 @@ const env = await startEnv({ stateDir: root, host: '127.0.0.1', port: 0,
   env: { MAKEFUN_SHOP_TOKEN: token },
   log: line => phases.push({ time: (performance.timeOrigin + performance.now()) / 1000, line }) });
 const child = spawn(process.execPath, [...nodeArgs, resolve(repo, 'main.ts')], {
-  cwd: repo, stdio: ['ignore', 'ignore', 'pipe'],
+  cwd: repo, stdio: ['ignore', 'pipe', 'pipe'],
   env: { ...process.env, MAKEFUN_ENV_URL: `http://127.0.0.1:${env.address.port}`,
     MAKEFUN_SHOP_TOKEN: token, MAKEFUN_TRIAL_NOW: '2026-01-01T00:00:00Z' },
 });
 let stderr = '';
+let stdout = '';
+child.stdout.on('data', data => { stdout += data; });
 child.stderr.on('data', data => { stderr += data; });
 const closed = new Promise(resolve => child.on('close', resolve));
 const threads = pid => { try { return readdirSync(`/proc/${pid}/task`).map(Number); } catch { return [pid]; } };
@@ -34,7 +36,9 @@ try {
   const code = await closed;
   const state = readFileSync(resolve(root, 'export/state.json'));
   const result = { passed: outcome.passed, child_exit_code: code,
+    implementation: stdout.includes('[entry] native ') ? 'go' : 'typescript',
     state_sha256: createHash('sha256').update(state).digest('hex'),
+    perf_points: outcome.perf.points_total, perf_p50_us: outcome.perf.perf_p50_us,
     workloads: outcome.perf.workloads.map(w => ({ name: w.name, ms: w.p50_ms, rounds: w.rounds, points: w.points, error: w.error })),
     peak_rss_KiB: Number(/peak RSS (\d+) KiB/.exec(stderr)?.[1] ?? 0) };
   writeFileSync(resolve(root, 'result.json'), JSON.stringify(result, null, 2) + '\n');
@@ -44,5 +48,6 @@ try {
   await env.stop();
   writeFileSync(resolve(root, 'phases.json'), JSON.stringify(phases));
   writeFileSync(resolve(root, 'forge.stderr'), stderr);
+  writeFileSync(resolve(root, 'forge.stdout'), stdout);
   if (child.exitCode === null) child.kill();
 }

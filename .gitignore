@@ -1,0 +1,5 @@
+/bin/forge-linux-arm64
+/.cache/
+/.gv/
+*.pprof
+*.test

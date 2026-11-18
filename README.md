@@ -4,62 +4,61 @@
 [![rank](https://make.fun/badge/github-core-clone-01/mubudot/github-forge-makefun/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![reward](https://make.fun/badge/github-core-clone-01/mubudot/github-forge-makefun/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
-A standalone GitHub-compatible forge for the competition's API subset, written in erasable
-TypeScript for Node 22.18 or later. It uses only the standard library, keeps state in memory,
-and runs without installation, a git subprocess, or external services.
+An in-memory GitHub-compatible forge built by **Ethan Moore (mubudot)**.
+It uses only standard libraries, with no installation, Git subprocess, or external service.
 
-Built by **Ethan Moore (mubudot)**.
+`main.ts` starts the committed static Linux amd64 Go binary, forwards SIGTERM/SIGINT,
+and preserves its exit status. On ARM64 it selects the locally built ARM64 binary.
+If the executable is missing or cannot run, `fallback.ts` starts the existing Node 22
+TypeScript server in `app.ts` and `src/`. The selected server binds port 0, registers
+with `MAKEFUN_ENV_URL`, polls `/done`, and exits when the trial finishes.
 
-- `main.ts` handles registration and completion polling. `app.ts`, `src/http.ts`, and `src/fast.ts`
-  provide authenticated HTTP routing, JSON errors, request IDs, and synchronous hot routes.
-  `src/transport.ts` serves buffered HTTP/1.1 exchanges over TCP, with Node HTTP handling
-  uncommon request framing in the same process and store.
-- `src/store.ts` shares repositories, deterministic IDs, issues, labels, comments, and pulls across
-  REST v3, GraphQL v4, and MCP. `src/rest/` implements branches, commits, contents, issue workflows,
-  pull files, and squash merges with conflict detection per file.
-- `src/git/` implements SHA-1 objects, checksummed packs, OFS/REF deltas, pkt-lines, upload-pack
-  v2/v0 with shallow fetch/deepen, and receive-pack v0 with fast-forward checks and per-ref reports.
-- `src/graphql/` parses selections, variables, aliases, fragments, and directives, executes shared
-  store mutations, and supports introspection and cursor pagination. `src/mcp.ts` provides JSON-RPC
-  discovery for revision 2026-07-28, legacy initialization, and six repository/issue/pull tools.
+The native module is organized into `git`, `store`, `rest`, `graphql`, `mcp`, `api`,
+and `transport` packages. Git supports smart HTTP upload-pack v2/v0, shallow/deepen,
+receive-pack v0, SHA-1 objects, checksummed zlib packs, OFS/REF deltas, and per-ref
+fast-forward reports. REST v3, GraphQL v4, and MCP share repository, issue, comment,
+label, pull request, and squash-merge state. IDs and commit timestamps are deterministic.
 
-The performance design caches parsed routes, serialized issue reads, compressed Git objects,
-fetch replies, and report-status packets. Pack decoding reuses a synchronous inflater and uses
-one-shot SHA-1 checksums. Hot routes cache the expected bearer header and avoid
-per-request URL parsing. The transport reuses identical request headers and response prefixes,
-sends each buffered reply in one socket write with a content length, and uses a shared idle sweep.
-HTTP keep-alive advertises 65 seconds, with TCP_NODELAY. Optional Git negotiation is
-kept small. Mutations invalidate caches, and timestamps derive from `MAKEFUN_TRIAL_NOW`.
+The HTTP/1.1 transport uses reusable buffers, content lengths, keep-alive, chunked
+request decoding, TCP_NODELAY, and coalesced pipelined responses. Linux connections
+use blocking reads on dedicated threads, with a bounded thread count and netpoll
+fallback for additional clients. Each buffered response uses one blocking write,
+with partial writes retried under backpressure. There are no per-request socket deadlines.
+Serialized issue reads, parsed headers/routes, Git advertisements, compressed objects,
+and fetch replies are cached and invalidated by mutations. Go uses two processors,
+a 600 MiB soft memory limit, and GOGC 500 to leave room for the suite.
 
-All 120 conformance checks, including 15 MCP checks, pass with matching replay exports. Submitted
-revision d081ea1 scored feature 600, agent 200, and speed 141 in production. Local process grades
-reached 200 speed points; a local gVisor baseline scored 132–139, showing why sandbox measurements
-matter. Real gVisor comparisons of the buffered transport across 75 paired rounds measured a 5.6%
-geomean improvement against d081ea1; production speed still needs a new production grade. [Measurement notes](docs/production-speed.md) describe the
-sealed workloads, syscall counts, discarded experiments, and repeatable profiling commands.
-
-The forge implements a bounded API subset with no persistence, UI, multi-user administration, or
-full GitHub GraphQL schema. `FORGE_OWNER_LOGIN` can configure its single owner; otherwise the first
-authenticated address of an existing repository provisions the namespace.
-
-## Run it
+## Build and run
 
 ```sh
-# The competition environment must already be running at this origin.
+# Go 1.25.4; set GO=/path/to/go if needed. Produces both architectures.
+./scripts/build-native.sh
+# bin/forge-linux-amd64 is vendored; bin/forge-linux-arm64 is ignored.
+
 MAKEFUN_ENV_URL=http://127.0.0.1:8080 \
 MAKEFUN_SHOP_TOKEN=local-development-token \
-MAKEFUN_TRIAL_NOW=2026-01-01T00:00:00Z \
-node main.ts
+MAKEFUN_TRIAL_NOW=2026-01-01T00:00:00Z node main.ts
 
-# From the forge checkout, grade the current files against the supplied kit.
-FORGE_DIR="$PWD"
-KIT_DIR=/workspace/projects/2de6bbf5-9a6e-4c92-adbd-7caaf9109ad3/makefun/github-core-clone-01-kit
-(cd "$KIT_DIR" && taskset -c 0,1 node cli/makefun.mjs grade-local \
-  --kit . --bot "$FORGE_DIR" --driver process --worktree)
-
-# Focused protocol, parser, cache-invalidation, and lifecycle regression tests.
 node --test test/*.test.ts
+(cd native && GOCACHE=/tmp/forge-go-cache GOPATH=/tmp/forge-go-path go test ./...)
 ```
+
+The build uses `CGO_ENABLED=0 GOOS=linux`, `-trimpath`, and
+`-ldflags="-s -w -buildid="`, with VCS stamping disabled. Both outputs are static ELF
+executables and can be built without network access. The entry needs no writable
+repository. `FORGE_TS_FALLBACK=1` selects TypeScript for local comparison;
+`FORGE_TRANSPORT=netpoll` selects the Go comparison transport.
+
+For local grading, run the kit's `grade-local --kit . --bot <this directory>
+--driver process --worktree`. On ARM64, its snapshot excludes ignored files:
+temporarily remove the ARM64 binary's ignore rule while grading to exercise Go,
+then restore it. Without that override, the grade correctly exercises TypeScript.
+[Native measurement notes](docs/native-speed.md) record native grades, profiling,
+workload comparisons, and the remaining production measurement requirement.
+
+This is the competition's API subset: it has no persistence, UI, or multi-user
+administration. `FORGE_OWNER_LOGIN` can set its single owner; otherwise the first
+authenticated address of an existing repository provisions the namespace.
 
 ---
 
